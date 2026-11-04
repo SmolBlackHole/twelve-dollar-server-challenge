@@ -127,6 +127,8 @@
 | C++ 0.1.0 ([Receive hint](src/runs/701bae9/receive-hint-350000/summary.json)) | 350,000 | 60 s | 3,619,164 | 27,839.62 | 21.647 ms | 596.224 ms | 5,252.42 ms | 0% | 23.74 us | 981.70 MiB |
 | C++ 0.1.0 ([POLL_FIRST, repeat](src/runs/701bae9/receive-pollfirst-350000-repeat/summary.json)) | 350,000 | 60 s | 3,627,168 | 27,901.24 | 16.765 ms | 28.216 ms | 169.15 ms | 0% | 23.41 us | 948.54 MiB |
 
+Release `5166f4b`, 450k/5m, WSL 6.18, telemetry/perf/client diagnostics off: 16,081,329 requests, 43,462.96 requests/s, 19.93 us/request, hold p95/p99 14.18/47.41 ms, zero errors. Server peak 2087.41 MiB, no OOM kills. All 450k received responses; activation at 30.130s missed the 30.100s deadline, so the run failed despite passing HTTP thresholds. Generator peak RSS 542.43 MiB. [Data](src/runs/5166f4b/release-450000-5m/summary.json).
+
 WAL coalescing, 350k short pair: cap 32, CQ 128/8 ms, seed 20261104, fresh seed copies, telemetry/perf off. CPU/request -1.84%, kernel CPU -2.04%; hold p99 20.90 to 20.96 ms. [Data](src/runs/79cd8ce/wal-coalescing-350000-comparison/summary.json).
 
 Direct post reads, native Application path including JSON, six rotated 50k-request pairs: 0/1/4/16 likes, 20% misses, telemetry off. Reused output: 1.72 to 1.34 us/read (-22.4%); fresh output: 1.75 to 1.42 us/read. Identical status/JSON; six native contracts passed. No HTTP transport. [Data](src/runs/03180a1/btree-post-common-native/summary.json). The earlier 0/1/32/257-like fixture measured -39.6% ([data](src/runs/03180a1/btree-post-native/summary.json)).

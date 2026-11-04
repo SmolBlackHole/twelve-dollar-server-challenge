@@ -1,6 +1,208 @@
 # TODO
 
-Reference: `d297ca9`, 128 CQEs / 8 ms, 4-ms receive probes and 16 writes per transaction. Use 350k VUs, seed `20261104`, a fresh seeded database and 30s ramp. Profile for 5 minutes; short comparisons use 60s hold.
+## Transport pipeline
+
+Status: proposed, not approved for implementation. This section is the implementation plan once approved; later phases stay deferred until their own gates pass.
+
+### Goal and baseline
+
+Build a bounded, single-thread pipeline that separates completion collection, RX consumption, request execution and TX submission. Support independent RX/TX lifetimes and persistent multishot receive. Improve CPU/request and latency without changing HTTP, SQLite visibility or commit-before-response behavior.
+
+- Baseline: `5166f4b`, production one-shot receive, CQ collection 128/8 ms, drain cap 256 per ring, write cap 32, provided buffers 1024 x 4096 bytes per ring.
+- The [current-kernel control](src/runs/701bae9/ready-cq-http-control/summary.json) used 20.95 us/request with hold p99 18.11 ms at 350k. These are historical reference values, not a substitute for a matched control when testing new code.
+- The [primary-ready HTTP candidate](src/runs/701bae9/ready-cq-http-comparison/summary.json) used 6.9% more CPU and raised hold p99 to 58.87 ms. It was removed. Native queue or wait improvements do not establish an HTTP gain.
+- Target: stock Ubuntu 24.04 / Linux 6.8, one vCPU, the challenge RAM budget and no swap. Local Docker comparisons keep the existing 1-CPU/2-GiB server limits. Current WSL 6.18 results must remain labelled separately.
+- Keep C++23, strict typing, English and the existing formatting. Comments explain ownership or unusual behavior without trailing periods.
+
+### Architecture to implement
+
+```mermaid
+flowchart LR
+    CQ["CQ collection"] --> Events["Lossless completion records"]
+    Events --> RX["RX ownership and TX completion updates"]
+    RX --> Ready["Deduplicated active connections"]
+    Ready --> App["HTTP / existing SQLite paths"]
+    App --> TX["Reply preparation / SQEs"]
+    TX --> Submit["Submit and choose next work"]
+    Submit --> CQ
+```
+
+These are phases on the existing issuer thread. A request may wait for more input, a commit or a send completion instead of traversing every phase in one pass.
+
+| Record | Owner and purpose |
+| --- | --- |
+| Connection registry | Each ring owns its slots, generations and connection lifetime. Idle connections are not scanned on ordinary turns |
+| Hot connection state | Independent RX/TX state, request phase, queued-work bits, close state and a reference to the cold Exchange |
+| Cold Exchange | Existing parser, session and Reply storage, acquired when needed and recycled after its references are gone |
+| Completion record | One record per CQE, preserving signed result, operation identity, flags and selected-buffer ownership |
+| Active work item | A connection handle plus reasons to run; at most one pending ticket per connection |
+| RX backlog | Ordered leases into the existing provided-buffer pool, with preallocated metadata indexed by buffer ID |
+| Write batch / SQ | Existing cap-32 transaction batch and ring submission queues; retain their storage between turns |
+
+Completion records and work tickets are different types. Deduplicating work must never discard input, a partial-send result, an error or a terminal CQE. The attachment's 16-byte WorkItem is a sizing idea; measure real records, retain signed errors and do not silently narrow flags.
+
+Prefer typed 64-bit operation tags containing kind, slot and generation, scoped by the CQ's owning ring. Accept, wake, stop and cancellation tags have explicit control identities; they must not be decoded as ordinary connection slots. Work queues carry handles rather than dereferenceable pointers into retired records. Existing DB-batch pointers remain pinned until their batch releases them.
+
+### Scheduling and progress
+
+- [ ] Use one reusable active-work buffer per ring initially. Process RX, application and TX phases over that active set; do not introduce a queue, thread or allocation at every conceptual arrow.
+- [ ] Keep a connection's readiness reasons in its hot state. Clear ticket membership when taking work; retain or requeue only work that can actually progress. New RX while a request is DB/TX-busy must not cause repeated dispatch or a busy loop.
+- [ ] Start with at most 256 CQEs, 256 connection visits and 256 RX-buffer slices per ring per cycle. Limit one connection to two RX slices per visit before yielding. Carry remaining runnable work in FIFO order.
+- [ ] Reserve work-list capacity before consuming a CQE that may add a ticket. If carry-over fills the list, execute stages before collecting more. Queue saturation must not drop a CQE or require an unbounded overflow vector.
+- [ ] Allow at most one completed HTTP request to be dispatched per connection visit. A later pipelined request becomes eligible only after the previous response and reset complete.
+- [ ] Flush full write batches at 32 and partial batches before blocking. Preserve command order, per-connection order and existing read/write barriers; do not sort SQL requests by endpoint or ID in this block.
+- [ ] Submit prepared sends and cancellation SQEs before a blocking wait. Runnable application work, held input that can be consumed, pending commits and close work must be considered independently of `pending_count()`.
+- [ ] Keep CQ drain size, kernel wait minimum, timeout and application budgets separate controls. Do not wait for a work buffer to fill.
+- [ ] Keep the baseline's numeric empty-CQ policy, 128/8 ms with a 4-ms deferred-RX probe, during the first HTTP pipeline comparison. Runnable work prevents sleeping. Report the integrated pipeline effect rather than claiming that only multishot changed.
+- [ ] Exercise wait-one plus bounded drain as a correctness reference. Do not make it the performance default without comparison: the native [wait-policy test](src/runs/701bae9/multishot-wait-policies/summary.json) found higher CPU at 128/512 pingpong connections.
+- [ ] Keep wait/drain/timeout settings identical within pipeline or layout comparisons. Any required scheduling change gets its own reference and attribution; do not bundle it into an advertised layout gain.
+- [ ] Preserve primary-only SINGLE_ISSUER/DEFER_TASKRUN, satellite notifications, direct descriptors and lazy ring growth. Handle TASKRUN/overflow even with an empty SQ.
+
+### Ownership contracts
+
+- [ ] Replace the shared mutable receive/send Operation identity and exclusive `IoPhase` with independent RX, TX and request states. Define legal transitions before connecting the new collector to HTTP.
+- [ ] RX remains active across CQEs with MORE. Retire its pending operation only on its original terminal CQE. Count each submitted SQE and each terminal exactly once.
+- [ ] Track cancellation acknowledgements separately from original RX/TX completion. Wait for an acknowledgement only when a cancel was actually issued; natural ENOBUFS has none.
+- [ ] Do not rearm an RX identity while its prior original or expected cancel acknowledgement is outstanding. Do not submit a second send while the first still borrows Reply storage.
+- [ ] Apply send byte counts and errors exactly once before reducing them to a TX-ready reason. Preserve partial-send retries and immutable in-flight `msghdr`/`iovec`/payload storage.
+- [ ] Claim a completed request once. Keep it claimed through DB queuing, commit resolution, response preparation, send retries and the final session reset.
+- [ ] New input during that claim may enter the ordered RX backlog, but cannot call `prepare()` again, enqueue the same write twice, reset the parser or modify the current Reply.
+- [ ] Keep queued writes owned through commit/error resolution. Peer half-close does not discard an accepted write; server-stop cancellation retains the current policy. A committed command must never be replayed after serialization or send failure.
+- [ ] Return selected buffers even for stale generations, cancelled operations and close races. Validate buffer IDs before access; generation checks prevent touching a new connection, not premature freeing of old kernel-borrowed memory.
+- [ ] Check generation reuse and wrap. Never allow a wrapped tag to alias an outstanding ticket or operation; retire an exhausted slot rather than silently reusing its identity.
+- [ ] Retire a connection only after original RX/TX terminals, issued cancel acknowledgements, close completion, DB references, completion records, RX leases and active tickets have been resolved.
+- [ ] Separate `rx_eof` from request-level `close_after`. Drain bytes and complete valid requests already received before EOF in order, then close. Preserve explicit Connection: close, auth/framing failure and incomplete-final-request behavior.
+- [ ] Define normal and fatal destruction order. Stop kernel access first; release all backlog/connection leases before `ReceiveBuffers` is destroyed. The current `Ring` destructor resets that pool before member destruction, which cannot remain unchanged once members own leases.
+
+### Bounded input and buffer reuse
+
+- [ ] Keep the current 1024 x 4096-byte provided pool for the first comparison. Preallocate backlog metadata; do not add a heap allocation or grow a vector per CQE.
+- [ ] While a request is DB/TX-busy, retain incoming leases in its ordered chain instead of appending more bytes to the busy session. Additional held pool payload is then bounded by the existing 4 MiB per ring.
+- [ ] Once the request is eligible, consume an existing session tail first. Feed at most one lease-sized chunk into the session, drive incremental parsing and return that lease promptly. Do not copy a whole queued pipeline into another large string.
+- [ ] Keep the current HTTP grammar and limits. URL, individual header field/value and body have 16-KiB checks, but total header bytes and pipeline bytes do not. A staging high-water mark must pause transport, not become a new request rejection limit.
+- [ ] Start with a soft pause trigger of two queued RX leases per connection and resume below one. These are experiment settings, not hard per-connection byte guarantees: already selected CQEs can overshoot them.
+- [ ] Pause multishot RX through targeted cancellation. Preserve all selected data until consumption; terminal CQEs and cancellation acknowledgements may arrive in either order.
+- [ ] Consuming a held lease must not require a receive credit, RX terminal or cancel acknowledgement. Rearming RX requires lifetime/request eligibility and either returned-buffer credit or bounded timed-probe permission.
+- [ ] Use returned-buffer credits and a bounded timed probe for ENOBUFS recovery. Do not retry every paused connection on every turn or let newly active work permanently overtake deferred work.
+- [ ] Ensure TX, partial-send handling, commit flush, cancel, close and stop need no RX lease to progress. Do not add a circular dependency between RX availability and the response that would release it.
+- [ ] Test the all-leases-held case. When a client starts draining an owed response or closes, eligible held input and deferred receivers must resume within the scheduler's bounded work budget.
+- [ ] Distinguish internal deadlock from external backpressure. Permanently stalled senders/readers can occupy the shared pool; this plan does not promise fairness for every other reader under that condition. If normal challenge traffic monopolizes the pool, stop and revise the policy before enabling production multishot.
+- [ ] Account separately for pool payload, metadata, session tails, parser strings, replies, allocator overhead and kernel sockets. Four MiB of held RX payload is not a four-MiB limit on total ingress memory.
+
+This block does not revive the discarded global byte-admission experiment, per-request scans of all rings, new client timeouts or arbitrary eviction. Any need for those is a new decision.
+
+### Implementation phases and gates
+
+#### 0. Freeze the comparison contract
+
+- [x] Read the current code, both supplied notes and the prior reference findings.
+- [ ] Record the baseline executable, source patch, generator identity, seed, kernel, cgroup limits and work profile before implementation.
+- [ ] Keep `5166f4b` and its existing measurements. Do not run a new baseline merely to restate known results.
+- [ ] Define native fixture sizes and acceptable measurement spread before the first comparison. Equal bytes, requests, replies and lifecycle work are mandatory.
+
+Gate: the implementation scope and this plan are approved. No production files change during planning.
+
+#### 1. Screen the pipeline handoff in the native probe
+
+Likely files: `src/benchmarks/receive.cpp`, `src/benchmarks/receive_backend.hpp`, `src/tests/receive_backend.cpp`.
+
+- [ ] Add a bounded CQ-collection/RX-consumption handoff to the probe only. Keep the control's one-shot request gate, wait policy, buffer budget and useful work unchanged.
+- [ ] Measure collection-to-consumption overhead without introducing HTTP, new ownership IDs or a layout change in the same comparison.
+- [ ] Cover fragmented bytes, multiple CQEs for one connection, independent connections, negative/terminal completions, wrap and full handoff storage.
+- [ ] Compare CPU, kernel CPU, producer CPU, raw RTT and buffer return/rearm behavior at 16/128/512 connections with short fixed-work runs.
+- [ ] Treat a repeatable CPU regression outside the controls' own spread as a failed cost screen. Do not compensate by enlarging batches or buffers silently; revisit the number of handoffs first.
+
+Gate: lossless ownership and a justified handoff cost. A native pass permits the ownership work, not an HTTP performance claim. This is a probe experiment, not a temporary second production backend.
+
+#### 2. Build the independent operation and request state model
+
+Likely files: `src/server/net/connection.hpp`, `connections.*`, `reactor.*`, `ring.*`; focused native tests.
+
+- [ ] Introduce typed connection/operation identities and their control-tag decoding. Document bit ranges, generation advancement and cancellation matching.
+- [ ] Separate RX, TX, request and close lifetimes. Remove mutation of one operation kind between receive and send in the new path.
+- [ ] Implement terminal-only pending accounting, stale-tag handling and the explicit retirement predicate.
+- [ ] Add native multishot cases for MORE, simultaneous RX/TX, partial send, queued data plus cancel, natural ENOBUFS, EOF and close races.
+- [ ] Exercise stale slot reuse, late CQEs and generation exhaustion. Confirm selected buffers return exactly once even when the connection handle is stale.
+- [ ] Verify fatal teardown with live operations and held leases before relying on destructors.
+
+Gate: state/lifetime contracts pass independently. Do not activate persistent RX in the HTTP server until bounded input and request gating are complete.
+
+#### 3. Integrate the bounded active-work pipeline
+
+Likely files: `src/server/server.cpp`, `src/server/net/*`, session driving in `src/server/http/session.*`, existing transport/session/application tests.
+
+- [ ] Connect lossless completion collection, ordered RX backlog and deduplicated ready tickets. Keep record ownership inside the ring/registry.
+- [ ] Drive session/auth/request execution only when its request phase permits. Keep llhttp, application handlers, SQL/B-tree paths, Reply formatting and commit semantics.
+- [ ] Keep the existing cap-32 write batch. Preserve its full/partial flush points and raw-target lifetime until responses are staged and the batch is cleared.
+- [ ] Prepare sends in the TX phase and publish SQEs in groups. Do not mutate an active Reply; dispatch the next pipelined request only after its predecessor finishes.
+- [ ] Implement the pause/rearm/backlog rules above before production multishot is enabled.
+- [ ] Make the loop's progress/exit condition include userspace work, held input that can run, pending commits and closing records, not just kernel pending count.
+- [ ] Add saturation tests for full work lists, exhausted leases, TX-busy input, parser fragments, long valid header sequences, partial sends and repeated pause/resume.
+- [ ] Add HTTP tests for write-then-read pipelines, duplicate-readiness events, auth/body rejection, half-close with several valid requests, incomplete final requests and stop during a pending commit/send.
+- [ ] Keep control/stop processing possible at capacity. Verify no dropped bytes, duplicate writes, response reordering, unbounded growth, retry spinning or premature record reuse.
+- [ ] Make the production cutover directly after its gate passes. Remove the old exclusive-I/O completion path and obsolete APIs; keep historical controls in Git and probes rather than a permanent runtime compatibility switch.
+- [ ] Run the first matched short 350k HTTP control/candidate pair before changing layouts. Fix the numeric wait settings, drain/pool budgets and write cap; retain the accepted pipeline executable as the next layout control.
+
+Gate: native, HTTP ordering and exhaustion tests pass and the first HTTP comparison justifies continuing. Do not use a later layout change to conceal a pipeline regression. Parser/application/storage changes outside transport-driving requirements are separate work. If a memory or fairness fix requires new API behavior, stop and revise the plan.
+
+#### 4. Measure storage and locality with the same scheduler
+
+Likely files: `src/server/net/connections.*`, connection storage and the focused native probes.
+
+- [ ] Record release-mode sizes, offsets and allocations for hot records, operation tags, backlog metadata, Exchanges and work items. Report open/active/pooled counts separately.
+- [ ] Start from compact AoS hot records and the existing cold Exchange boundary. Compare stable, lazily allocated slot blocks with per-connection allocation before adding AoSoA.
+- [ ] Compare a small AoSoA block only where access traces justify grouping fields. Keep handles valid through growth and reclaim no slot before its lifetime gate.
+- [ ] Consider SoA for actual bulk scans; do not replace event-driven indexed access with full-registry scans to make vectorization possible.
+- [ ] Keep wait policy, drain budgets, pool size and request ordering fixed across each layout comparison. Measure cache behavior where counters are available, plus CPU, memory and tails.
+- [ ] Retain a layout only with a measured benefit. Remove rejected layout code rather than accumulating template/runtime branches.
+- [ ] Confirm a promising layout against the accepted phase-3 pipeline with the same short HTTP workload and wait policy before tuning scheduling.
+
+Gate: stable identity/lifetime tests still pass and the memory/CPU tradeoff is explicit. SIMD, ISA flags and compiler tuning remain outside this phase.
+
+#### 5. Choose the scheduling policy and validate HTTP performance
+
+- [ ] Use one short CPU profile when the new hot path is unclear. Distinguish user CPU, kernel CPU, wall waits and generator work; do not infer blocked duration from CPU samples.
+- [ ] Limit wait-policy screening to a few justified candidates. Vary kernel minimum, timeout and user-space work budget independently; keep the full-buffer case and the known-ready-CQE case.
+- [ ] Compare wait policies within the same accepted pipeline/layout first. The final comparison against `5166f4b` measures the whole retained change, not the isolated effect of its wait minimum.
+- [ ] Check CQ/satellite progress, TASKRUN and overflow with an empty SQ, bounded RX retries and idle blocking. No spinning to manufacture low latency.
+- [ ] Compare the chosen candidate with a frozen baseline executable at 350k, seed `20261104`, 30s ramp and 60s hold, using a fresh copy of the seeded DB and the same current generator.
+- [ ] Keep internal telemetry, perf and client diagnostics off for the performance pair. Run profiling separately and avoid concurrent builds or competing load tests.
+- [ ] Reject late activation, incomplete response coverage, workflow errors or different useful work as performance evidence. Preserve their result records.
+- [ ] Report whole-run server CPU/request, hold p95/p99, requests, errors, cgroup memory, buffer/rearm behavior from separate counted runs and generator resource use.
+- [ ] Keep performance claims within the controls' measured spread. A CPU/latency tradeoff needs an explicit decision; passing the challenge threshold alone is not an optimization win.
+- [ ] Repeat in reverse order only to resolve an actual ambiguity. Run a five-minute confirmation only after a promising short HTTP result; capacity runs are separate evidence.
+- [ ] Keep one checked source patch and binary/image identity per run. Publish summaries; keep raw profiles, traces and patches private under their run.
+
+Gate: retain demonstrated gains without changing API behavior or the resource budget. If the pipeline loses, isolate or remove the losing part; do not silently retune unrelated SQL or memory settings to hide it.
+
+### Diagnostics and references
+
+- [ ] Extend existing typed telemetry only where needed: work depth/age, dedup count, held RX bytes/leases, RX/TX/request phases, pause/cancel/rearm and write-batch size.
+- [ ] Put timing or bounded flight records in profile mode. Release/off must add no diagnostic clocks, formatting or logging; inspect the generated hot-path code after adding hooks.
+- [ ] Distinguish enqueue-to-service age from kernel completion-to-service age. The latter needs kernel event timing; an application timestamp alone cannot supply it.
+
+Use references for specific mechanisms, not as new runtime dependencies:
+
+- [Rust kensac](submissions/rust-iouring-kensac/src/main.rs): persistent receive and stable in-flight send/output ownership.
+- [C pavlyhalim](submissions/c-iouring-pavlyhalim/src/server.c): gated reads and buffer-pressure handling; its current source uses multishot poll rather than multishot receive.
+- [Alyrn, Loop::HandleCqe](https://github.com/archiyun/Alyrn/blob/main/src/uring/loop.cc): distinguish result publication, kernel retirement and runnable work; separate CQ and ready-work budgets. Its implementation also interleaves work, so it is not evidence that fully separated phases are faster.
+- [Helio, UringProactor::ProcessCqeBatch](https://github.com/romange/helio/blob/master/util/fibers/uring_proactor.cc): retain multishot callback identity while MORE is set; recycle only at terminal completion.
+- [Seastar reactor](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc): check scheduled work as well as I/O pollers before declaring the loop idle.
+- [liburing](https://github.com/axboe/liburing): MORE, provided buffers, cancellation and queue mechanics. Avoid APIs that require a kernel newer than 6.8.
+
+The newer scored leaderboard revision can differ from the code in this checkout. Reference patterns and submission-authored measurements are not measurements of our server.
+
+### Deferred decisions
+
+- Separate physical RX/app/TX queues only if the single active-set experiment shows a reason to split storage.
+- Cross-request read coalescing, result caches and new shared read snapshots.
+- New database workers, a SQLite driver, fibers/coroutines, an event bus, a userspace TCP stack, epoll replacement or extra event-loop threads.
+- Global byte admission, new client timeout/eviction policies and kernel/network tuning.
+- AVX2/AVX-512, PGO, unrolling and new compiler settings. Revisit only a measured hot loop after the ownership/scheduler/layout comparisons.
+
+## Existing experiments and later work
+
+Historical full-profile reference: `d297ca9`, 128 CQEs / 8 ms, 4-ms receive probes and 16 writes per transaction. Current production uses cap 32; the transport baseline above supersedes this as the implementation reference.
 
 - [x] Remove the receive `SOCK_NONEMPTY` hint after the [350k pair](src/runs/701bae9/receive-hint-350000-comparison/summary.json): CPU +1.4%, kernel CPU +2.3%, hold p99 30.16 to 1061.67 ms. Keep native/full results and Docker packaging fixes; tail cause unresolved
 - [x] Compare isolated one-shot/multishot receive under WSL 6.18.54.1 ([data](src/runs/701bae9/multishot-receive-native-v2/summary.json)): queued-stream CPU -60.4%, kernel CPU -61.3%, four improving pairs; pingpong inconclusive. Six contracts passed, including MORE, EOF, concurrent send, exhaustion/rearm and cancellation races. Production server matches the no-hint binary
@@ -10,7 +212,7 @@ Reference: `d297ca9`, 128 CQEs / 8 ms, 4-ms receive probes and 16 writes per tra
 - [x] Isolate the 128-socket wait regression ([data](src/runs/701bae9/multishot-128-analysis/summary.json)): a known-ready CQE waits 8.03 ms at target 128. CQ 32 cuts native stream wall time from 309 to 58 ms; extra buffers alone reach 152 ms
 - [x] Compare ready-first and wait-one at 16/128/512 sockets ([data](src/runs/701bae9/multishot-wait-policies/summary.json)). Ready-first improves streams; wait-one lowers pingpong p99 but costs more CPU at 128/512. Six suites passed, including queued SQEs, deferred work, cancellation and the 256-CQE bound
 - [x] Reject the primary-ready-only HTTP change after the [350k pair](src/runs/701bae9/ready-cq-http-comparison/summary.json): CPU 20.95 to 22.38 us/request, hold p99 18.11 to 58.87 ms. Both passed with zero errors; restore production and keep the native experiments
-- [ ] Decide on a bounded RX/TX transport prototype after the reference comparison; keep parser/application/storage and compare ownership/layout options before implementing
+- [ ] Approve the proposed transport pipeline above before implementation; keep parser/application/storage and complete each phase's gate before moving on
 
 - [x] Capture the [five-minute profile](src/runs/d297ca9/baseline-full-profile-350000-5m-analysis/summary.json): 217,114 CPU samples, no lost records, 20.56 us/request and zero HTTP errors. Recover the saved data after the original decoder timeout
 - [x] Keep cap 32 after the 16/32-write comparison: 3.2% less CPU and 2.4% less kernel CPU in the short pair. The historical full-profile reference remains cap 16
