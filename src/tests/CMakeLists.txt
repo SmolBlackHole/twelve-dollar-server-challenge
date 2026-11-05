@@ -1,9 +1,19 @@
 tds_add_executable(transport_tests transport.cpp)
 target_link_libraries(transport_tests PRIVATE transport api sqlite yyjson OpenSSL::Crypto)
-target_link_options(transport_tests PRIVATE -Wl,--wrap=sqlite3_step)
+target_link_options(transport_tests PRIVATE -Wl,--wrap=sqlite3_step
+    -Wl,--wrap=io_uring_submit -Wl,--wrap=io_uring_submit_and_wait
+    -Wl,--wrap=io_uring_submit_and_wait_timeout)
 
 tds_add_executable(io_lifetime_tests io_lifetimes.cpp)
 target_link_libraries(io_lifetime_tests PRIVATE transport uring llhttp_static yyjson)
+
+tds_add_executable(operation_state_tests operation_state.cpp)
+
+target_link_libraries(operation_state_tests PRIVATE transport)
+
+tds_add_executable(pipeline_tests pipeline.cpp)
+
+target_link_libraries(pipeline_tests PRIVATE transport uring)
 
 tds_add_executable(receive_backend_tests receive_backend.cpp)
 target_link_libraries(receive_backend_tests PRIVATE transport uring Threads::Threads)
@@ -74,6 +84,8 @@ target_link_options(load_activation_tests PRIVATE
 add_test(NAME io_uring_operations COMMAND server --self-test)
 add_test(NAME transport_lifetimes COMMAND transport_tests)
 add_test(NAME io_lifetime_contract COMMAND io_lifetime_tests)
+add_test(NAME operation_state_contract COMMAND operation_state_tests)
+add_test(NAME pipeline_ownership_contract COMMAND pipeline_tests)
 add_test(NAME receive_backend_contract COMMAND receive_backend_tests)
 add_test(NAME checkpoint_lifetimes COMMAND checkpoint_tests)
 add_test(NAME group_commit_contract COMMAND group_commit_tests)
@@ -91,11 +103,11 @@ add_test(NAME load_generator_conformance COMMAND load_tests)
 add_test(NAME load_generator_latencies COMMAND latency_tests)
 add_test(NAME load_generator_activation COMMAND load_activation_tests)
 
-set_tests_properties(io_uring_operations transport_lifetimes io_lifetime_contract receive_backend_contract
+set_tests_properties(io_uring_operations transport_lifetimes io_lifetime_contract receive_backend_contract pipeline_ownership_contract
     PROPERTIES LABELS "native;transport;integration")
 set_tests_properties(checkpoint_lifetimes group_commit_contract application_contract btree_feed btree_post_contract wal_vfs_contract
     PROPERTIES LABELS "native;database;integration")
-set_tests_properties(post_writer_bytes parser_contract session_contract reply_bytes
+set_tests_properties(post_writer_bytes parser_contract session_contract reply_bytes operation_state_contract
     PROPERTIES LABELS "native;unit")
 set_tests_properties(sync_timing_contract PROPERTIES LABELS "native;database;unit")
 set_tests_properties(telemetry_contract PROPERTIES LABELS "native;unit")

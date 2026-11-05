@@ -84,6 +84,7 @@ Unchecked items are experiments; checked items include completed work and discar
 ### Memory and ownership
 
 - [ ] Separate backlog from leaks with `anon`, socket, file and kernel memory through load, drain and a quiet period. Check live ownership and bounded pool retention; reaching the cgroup limit alone does not identify a leak. Compare `sock/N_live` and `slab/N_live` at equal connection counts.
+  Attribute slab classes at a fixed hold point: the [450k diagnostic](src/runs/ed7fa29/diagnostic-450000-60s/summary.json) uses about 1679 MiB kernel/slab at 60s, versus 108 MiB anon. Historical 350k kernel memory was 539 MiB on WSL 6.6 and 1308 MiB on 6.18; source/instruments differ, so this is not a kernel A/B. Keep hold and drain peaks separate.
 
 - [ ] Compare stable connection slabs when connection churn, allocation or connection memory is material.
   CQEs already carry `Connection*`, and each ring owns a table indexed by direct slot. Measure construction and destruction before replacing per-connection allocations.
@@ -171,6 +172,7 @@ Unchecked items are experiments; checked items include completed work and discar
 - [x] Compare native ready-first policies ([data](src/runs/701bae9/multishot-wait-policies/summary.json)): at 128 sockets, ready-first cuts stream wall time from 276 to 87 ms. Pingpong p99 falls from 16.83 to 9.21 ms at 4.72 to 4.67 us/request. Wait-one reaches 0.83 ms but costs 5.56 us/request; keep this as a measured tradeoff, not an HTTP gain.
 
 - [ ] Prototype independent RX/TX with bounded input while replies are pending; compare CPU and tails before keeping it. Preserve the current parser, Reply, write batching and SQLite paths.
+  The [one-shot CQ/RX handoff screen](src/runs/ed7fa29/receive-handoff-native/summary.json) passes its CPU-cost gate at -0.11% to +2.65% with a fixed 12-KiB FIFO. This only permits the ownership step in TODO.md; production multishot and HTTP gains remain open.
   It needs separate stable receive/send operation identities, terminal-CQE tracking and bounded `ENOBUFS` rearming; the current one-operation-per-connection model cannot track concurrent receive/send operations.
   Bound queued input while sends are outstanding, preserve HTTP response order and return each selected buffer exactly once, including shutdown and cancellation.
   Compare [Rust's stable wire/output ownership](submissions/rust-iouring-kensac/src/main.rs) with [C's multishot poll and gated reads](submissions/c-iouring-pavlyhalim/src/server.c). Their current sources use different receive strategies; the local leaderboard may refer to newer scored revisions.

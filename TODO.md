@@ -2,7 +2,7 @@
 
 ## Transport pipeline
 
-Status: proposed, not approved for implementation. This section is the implementation plan once approved; later phases stay deferred until their own gates pass.
+Status: approved. Active phase: 3, bounded pipeline integration. Later phases stay deferred until their own gates pass.
 
 ### Goal and baseline
 
@@ -96,9 +96,11 @@ This block does not revive the discarded global byte-admission experiment, per-r
 #### 0. Freeze the comparison contract
 
 - [x] Read the current code, both supplied notes and the prior reference findings.
-- [ ] Record the baseline executable, source patch, generator identity, seed, kernel, cgroup limits and work profile before implementation.
-- [ ] Keep `5166f4b` and its existing measurements. Do not run a new baseline merely to restate known results.
-- [ ] Define native fixture sizes and acceptable measurement spread before the first comparison. Equal bytes, requests, replies and lifecycle work are mandatory.
+- [x] Record the baseline executable, source patch, generator identity, seed, kernel, cgroup limits and work profile before implementation: [frozen release run](src/runs/5166f4b/release-450000-5m/summary.json), with its private manifest and raw environment.
+- [x] Keep `5166f4b` and its existing measurements. Do not run a new baseline merely to restate known results.
+- [x] Define native fixture sizes and acceptable measurement spread before the first comparison. Equal bytes, requests, replies and lifecycle work are mandatory.
+
+Native cost screen: one-shot receive, batch128/8 ms, the same 4-MiB pool, 64-MiB streams and 8192 pingpong requests at 16/128/512 sockets. Four pairs alternate A/B and B/A. A median paired CPU regression above both 3% and the controls' relative IQR, with at least three slower pairs, fails the screen. Control IQR above 10% is inconclusive.
 
 Gate: the implementation scope and this plan are approved. No production files change during planning.
 
@@ -106,11 +108,13 @@ Gate: the implementation scope and this plan are approved. No production files c
 
 Likely files: `src/benchmarks/receive.cpp`, `src/benchmarks/receive_backend.hpp`, `src/tests/receive_backend.cpp`.
 
-- [ ] Add a bounded CQ-collection/RX-consumption handoff to the probe only. Keep the control's one-shot request gate, wait policy, buffer budget and useful work unchanged.
-- [ ] Measure collection-to-consumption overhead without introducing HTTP, new ownership IDs or a layout change in the same comparison.
-- [ ] Cover fragmented bytes, multiple CQEs for one connection, independent connections, negative/terminal completions, wrap and full handoff storage.
-- [ ] Compare CPU, kernel CPU, producer CPU, raw RTT and buffer return/rearm behavior at 16/128/512 connections with short fixed-work runs.
-- [ ] Treat a repeatable CPU regression outside the controls' own spread as a failed cost screen. Do not compensate by enlarging batches or buffers silently; revisit the number of handoffs first.
+- [x] Add a bounded CQ-collection/RX-consumption handoff to the probe only. Keep the control's one-shot request gate, wait policy, buffer budget and useful work unchanged.
+- [x] Measure collection-to-consumption overhead without introducing HTTP, new ownership IDs or a layout change in the same comparison.
+- [x] Cover fragmented bytes, multiple CQEs for one connection, independent connections, negative/terminal completions, wrap and full handoff storage.
+- [x] Compare CPU, kernel CPU, producer CPU, raw RTT and buffer return/rearm behavior at 16/128/512 connections with short fixed-work runs.
+- [x] Treat a repeatable CPU regression outside the controls' own spread as a failed cost screen. Do not compensate by enlarging batches or buffers silently; revisit the number of handoffs first.
+
+The [four-pair screen](src/runs/ed7fa29/receive-handoff-native/summary.json) passes the declared CPU-cost gate: median paired change -0.11% to +2.65%, fixed storage 12,296 bytes, equal bytes/replies, contracts passed. Higher 128-socket RTT is not isolated to the handoff: a [fresh-cgroup check](src/runs/ed7fa29/receive-handoff-latency-check/summary.json) reproduces roughly 30-ms tails in both paths with throttling, versus roughly 1 ms in most unthrottled samples. Production remains unchanged; the probe rejects the staged multishot consumer until its independent state model exists.
 
 Gate: lossless ownership and a justified handoff cost. A native pass permits the ownership work, not an HTTP performance claim. This is a probe experiment, not a temporary second production backend.
 
@@ -118,12 +122,14 @@ Gate: lossless ownership and a justified handoff cost. A native pass permits the
 
 Likely files: `src/server/net/connection.hpp`, `connections.*`, `reactor.*`, `ring.*`; focused native tests.
 
-- [ ] Introduce typed connection/operation identities and their control-tag decoding. Document bit ranges, generation advancement and cancellation matching.
-- [ ] Separate RX, TX, request and close lifetimes. Remove mutation of one operation kind between receive and send in the new path.
-- [ ] Implement terminal-only pending accounting, stale-tag handling and the explicit retirement predicate.
-- [ ] Add native multishot cases for MORE, simultaneous RX/TX, partial send, queued data plus cancel, natural ENOBUFS, EOF and close races.
-- [ ] Exercise stale slot reuse, late CQEs and generation exhaustion. Confirm selected buffers return exactly once even when the connection handle is stale.
-- [ ] Verify fatal teardown with live operations and held leases before relying on destructors.
+- [x] Introduce typed connection/operation identities and their control-tag decoding. Document bit ranges, generation advancement and cancellation matching.
+- [x] Separate RX, TX, request and close lifetimes. Remove mutation of one operation kind between receive and send in the new path.
+- [x] Implement terminal-only pending accounting, stale-tag handling and the explicit retirement predicate.
+- [x] Add native multishot cases for MORE, simultaneous RX/TX, partial send, queued data plus cancel, natural ENOBUFS, EOF and close races.
+- [x] Exercise stale slot reuse, late CQEs and generation exhaustion. Confirm selected buffers return exactly once even when the connection handle is stale.
+- [x] Verify fatal teardown with live operations and held leases before relying on destructors.
+
+Production state model passed [all 20 release tests](src/runs/ed7fa29/phase2-native-off-v3/summary.json) and the [four affected profile suites](src/runs/ed7fa29/phase2-native-profile-v1/summary.json). The exact generation-exhaustion counter is tested; the store's exhausted-slot branch is reviewed rather than forced through trillions of reuse cycles. Transient RX retries and both cancellation orders are covered. HTTP remains one-shot until phase 3 adds backlog and completion/work/DB lifetime pins.
 
 Gate: state/lifetime contracts pass independently. Do not activate persistent RX in the HTTP server until bounded input and request gating are complete.
 
@@ -131,17 +137,22 @@ Gate: state/lifetime contracts pass independently. Do not activate persistent RX
 
 Likely files: `src/server/server.cpp`, `src/server/net/*`, session driving in `src/server/http/session.*`, existing transport/session/application tests.
 
-- [ ] Connect lossless completion collection, ordered RX backlog and deduplicated ready tickets. Keep record ownership inside the ring/registry.
-- [ ] Drive session/auth/request execution only when its request phase permits. Keep llhttp, application handlers, SQL/B-tree paths, Reply formatting and commit semantics.
-- [ ] Keep the existing cap-32 write batch. Preserve its full/partial flush points and raw-target lifetime until responses are staged and the batch is cleared.
-- [ ] Prepare sends in the TX phase and publish SQEs in groups. Do not mutate an active Reply; dispatch the next pipelined request only after its predecessor finishes.
-- [ ] Implement the pause/rearm/backlog rules above before production multishot is enabled.
-- [ ] Make the loop's progress/exit condition include userspace work, held input that can run, pending commits and closing records, not just kernel pending count.
-- [ ] Add saturation tests for full work lists, exhausted leases, TX-busy input, parser fragments, long valid header sequences, partial sends and repeated pause/resume.
-- [ ] Add HTTP tests for write-then-read pipelines, duplicate-readiness events, auth/body rejection, half-close with several valid requests, incomplete final requests and stop during a pending commit/send.
-- [ ] Keep control/stop processing possible at capacity. Verify no dropped bytes, duplicate writes, response reordering, unbounded growth, retry spinning or premature record reuse.
+- [x] Connect lossless completion collection, ordered RX backlog and deduplicated ready tickets. Keep record ownership inside the ring/registry.
+- [x] Drive session/auth/request execution only when its request phase permits. Keep llhttp, application handlers, SQL/B-tree paths, Reply formatting and commit semantics.
+- [x] Keep the existing cap-32 write batch. Preserve its full/partial flush points and raw-target lifetime until responses are staged and the batch is cleared.
+- [x] Prepare sends in the TX phase and publish SQEs in groups. Do not mutate an active Reply; dispatch the next pipelined request only after its predecessor finishes.
+- [x] Implement the pause/rearm/backlog rules above before production multishot is enabled.
+- [x] Make the loop's progress/exit condition include userspace work, held input that can run, pending commits and closing records, not just kernel pending count.
+- [x] Add saturation tests for full work lists, exhausted leases, TX-busy input, parser fragments, long valid header sequences, partial sends and repeated pause/resume.
+- [x] Add HTTP tests for write-then-read pipelines, duplicate-readiness events, auth/body rejection, half-close with several valid requests, incomplete final requests and stop during a pending commit/send.
+- [x] Keep control/stop processing possible at capacity. Verify no dropped bytes, duplicate writes, response reordering, unbounded growth, retry spinning or premature record reuse.
 - [ ] Make the production cutover directly after its gate passes. Remove the old exclusive-I/O completion path and obsolete APIs; keep historical controls in Git and probes rather than a permanent runtime compatibility switch.
 - [ ] Run the first matched short 350k HTTP control/candidate pair before changing layouts. Fix the numeric wait settings, drain/pool budgets and write cap; retain the accepted pipeline executable as the next layout control.
+- [ ] Before phase 4, isolate the higher tails: hold p99 rose from 18.53 to 74.62 ms in the first 350k pair. Keep the pipeline, workload and numeric wait settings fixed while locating the stalls; do not hide the regression behind layout changes.
+
+Checks: [21 release tests](src/runs/ed7fa29/phase3-regressions-off/summary.json), [five profile suites](src/runs/ed7fa29/phase3-profile/summary.json) and [five ASan/UBSan suites](src/runs/ed7fa29/phase3-sanitized/summary.json) passed. Regression cases cover SEND/data/EOF in one collected prefix, positive terminal RX rearming and TX/stop with all RX leases held. The [updated retry probe](src/runs/ed7fa29/phase3-probes-sanitized-v2/summary.json) also passed with sanitizers.
+
+The [first 350k pair](src/runs/ed7fa29/phase3-http-comparison/summary.json) passed with zero errors: CPU 20.63 to 19.39 us/request (-6.0%, kernel -7.0%), hold p99 18.53 to 74.62 ms, peak RAM +72.73 MiB. No memory-limit events or OOM; both servers exited cleanly. Accepting this tradeoff remains open, so phase 4 stays deferred.
 
 Gate: native, HTTP ordering and exhaustion tests pass and the first HTTP comparison justifies continuing. Do not use a later layout change to conceal a pipeline regression. Parser/application/storage changes outside transport-driving requirements are separate work. If a memory or fairness fix requires new API behavior, stop and revise the plan.
 
@@ -239,7 +250,8 @@ Record user/kernel CPU per request, useful work, commits, RAM, errors and p99. R
 
 ## Later
 
-- [ ] Check socket/heap/pool memory after draining, then allocation reuse and socket-buffer caps in Ideas.md order
+- [ ] Attribute kernel slab at a fixed hold point and after draining, then allocation reuse and socket-buffer caps in Ideas.md order. The [450k diagnostic](src/runs/ed7fa29/diagnostic-450000-60s/summary.json) is dominated by kernel/slab, with memory-limit events but no OOM kills
+- [ ] Resolve missing profile telemetry after the 450k server exits 137 during cleanup; confirm graceful shutdown and export before relying on internal commit/rearm counters
 - [ ] Split foreground COMMIT stalls into sync/write/retry time and waiting before receive service; compare multishot receive afterward
 - [ ] Test capacity on comparable Linux hardware with a separate generator and the official file limit
 - [ ] Finally move our source/docs into `submissions/<stack>-SmolBlackHole/` and rename SUBMISSION.md to README.md

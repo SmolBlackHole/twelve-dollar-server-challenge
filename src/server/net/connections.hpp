@@ -27,6 +27,9 @@ class ConnectionStore
     void release(DirectSlot slot);
     Connection &create(Ring &owner, DirectSlot slot);
     void retire(DirectSlot slot);
+    // Kernel access must stop before teardown bypasses ordinary retirement checks
+    void clear() noexcept;
+    Connection *find(ConnectionKey key) const noexcept;
     Connection *at(std::size_t index) const noexcept;
     std::size_t size() const noexcept;
 #if TDS_TELEMETRY_LEVEL >= 1
@@ -39,7 +42,9 @@ class ConnectionStore
     friend class telemetry::IoTelemetry;
 
     std::vector<std::unique_ptr<Connection>> records_;
+    std::vector<SlotGeneration> generations_;
     std::vector<DirectSlot> free_slots_;
+    std::size_t exhausted_count_ = 0;
 #if TDS_TELEMETRY_LEVEL >= 1
     std::size_t live_count_ = 0;
 #endif

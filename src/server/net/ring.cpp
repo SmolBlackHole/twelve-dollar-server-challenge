@@ -9,7 +9,8 @@
 namespace tds::net
 {
 
-Ring::Ring(unsigned slots, bool primary) : connections(slots), wake_operation{Event::wake, *this}
+Ring::Ring(unsigned slots, bool primary, unsigned ring_index)
+    : index(ring_index), connections(slots)
 {
     exchange_pool_.reserve(max_pooled_exchanges);
     if (!primary)
@@ -58,6 +59,7 @@ Ring::Ring(unsigned slots, bool primary) : connections(slots), wake_operation{Ev
 
 Ring::~Ring()
 {
+    destroying_ = true;
     // Fatal exits stop kernel access before either connection or send storage is freed
     if (pending)
     {
@@ -70,8 +72,28 @@ Ring::~Ring()
             std::terminate();
         }
     }
+    for (auto &completion : completions)
+    {
+        completion.reset();
+    }
+    ready.clear();
+    backlog.clear();
+    connections.clear();
     receive_buffers.reset();
     io_uring_queue_exit(&queue);
+}
+
+bool Ring::try_retire(ConnectionKey key) noexcept
+{
+    auto *connection = connections.find(key);
+    if (destroying_ || !connection || !connection->retirable())
+    {
+        return false;
+    }
+    connections.retire(key.slot);
+    accept_refill_needed = true;
+
+    return true;
 }
 
 std::unique_ptr<http::Exchange> Ring::acquire_exchange()

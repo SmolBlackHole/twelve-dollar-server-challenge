@@ -19,6 +19,7 @@ using net::Completion;
 using net::CompletionKind;
 using net::Connection;
 using net::Reactor;
+using net::WorkReason;
 } // namespace
 
 class Server::State
@@ -48,17 +49,43 @@ class Server::State
     {
         const auto report_on_exit = telemetry.run(reactor);
         reactor.start();
-        while (reactor.pending_count())
+        while (reactor.has_work() || !pending_writes.commands.empty())
         {
-            reactor.begin_turn();
-            Completion completion;
-            while (reactor.next(completion))
+            if (!reactor.has_work())
             {
-                complete(completion);
-                if (pending_writes.commands.size() == write_batch_limit)
+                flush_writes();
+                if (!reactor.has_work())
                 {
-                    flush_writes();
+                    break;
                 }
+            }
+            reactor.begin_turn();
+            for (const auto &owner : reactor.rings())
+            {
+                run_work(*owner);
+            }
+            while (true)
+            {
+                auto completions = reactor.collect();
+                if (completions.empty())
+                {
+                    break;
+                }
+                auto &owner = *completions.front().source;
+                for (auto &completion : completions)
+                {
+                    ingest(completion);
+                }
+                // Transfer every result and lease before releasing completion lifetime pins
+                for (auto &completion : completions)
+                {
+                    completion.reset();
+                }
+                run_work(owner);
+            }
+            for (const auto &owner : reactor.rings())
+            {
+                run_work(*owner);
             }
             // Flush before the reactor waits so a partial batch cannot strand its replies
             flush_writes();
@@ -70,6 +97,7 @@ class Server::State
   private:
     void dispatch(Connection &connection)
     {
+        connection.claim_request();
         const auto &session = connection.exchange->session;
         auto sample = telemetry.handler(connection);
         auto prepared = application.prepare(session.accepted_head(), session.message().body);
@@ -96,6 +124,7 @@ class Server::State
 
     void send(Connection &connection)
     {
+        connection.send_ready = false;
         telemetry.send_prepared(connection);
         auto &message = connection.exchange->reply.message();
         reactor.send(connection, message);
@@ -106,7 +135,8 @@ class Server::State
         connection.close_after =
             connection.close_after || !connection.exchange->session.message().keep_alive;
         connection.exchange->reply.prepare(std::move(response), connection.close_after);
-        send(connection);
+        connection.start_response();
+        connection.send_ready = true;
     }
 
     void flush_writes()
@@ -121,7 +151,8 @@ class Server::State
         {
             for (auto *connection : connections)
             {
-                reactor.close(*connection);
+                connection->abandon_request();
+                close(*connection);
             }
             pending_writes.clear();
 
@@ -141,6 +172,10 @@ class Server::State
             }
             for (std::size_t index = 0; index < count; ++index)
             {
+                if (connections[index]->closing())
+                {
+                    continue;
+                }
                 try
                 {
                     responses[index] =
@@ -169,9 +204,16 @@ class Server::State
         for (std::size_t index = 0; index < count; ++index)
         {
             auto &connection = *connections[index];
+            if (connection.closing())
+            {
+                connection.abandon_request();
+                continue;
+            }
             connection.close_after =
                 connection.close_after || responses[index].status == Status::internal_error;
             respond(connection, std::move(responses[index]));
+            // This bounded response group is the batch's TX stage and needs no extra tickets
+            send(connection);
         }
         pending_writes.clear();
     }
@@ -181,6 +223,7 @@ class Server::State
         const auto index = pending_writes.commands.size();
         pending_writes.commands.push_back(std::move(command));
         pending_writes.connections[index] = &connection;
+        ++connection.db_refs;
         connection.start_queued_write();
     }
 
@@ -190,6 +233,7 @@ class Server::State
         auto &session = exchange.session;
         try
         {
+            bool may_feed = true;
             while (true)
             {
                 const auto result = session.consume();
@@ -221,16 +265,21 @@ class Server::State
                 {
                     dispatch(connection);
                 }
-                else
+                else if (may_feed && receive_input(connection))
                 {
-                    reactor.receive(connection);
+                    may_feed = false;
+                    continue;
                 }
-
                 return;
             }
         }
         catch (const std::exception &error)
         {
+            if (connection.request_phase == net::RequestPhase::responding)
+            {
+                // A failed send cannot become a second response or replay an accepted write
+                throw;
+            }
             std::cerr << "request failed: " << error.what() << '\n';
             connection.close_after = true;
             respond(connection,
@@ -238,80 +287,237 @@ class Server::State
         }
     }
 
-    void complete_receive(Completion &completion)
+    void close(Connection &connection)
     {
-        const auto received = telemetry.receive();
-        auto &connection = *completion.connection;
-        if (!connection.exchange)
+        connection.ring.backlog.clear(connection.input);
+        connection.send_ready = false;
+        if (!connection.closing())
         {
-            connection.exchange = connection.ring.acquire_exchange();
+            reactor.close(connection);
         }
-        received.attach(connection);
-        const auto input = completion.buffer.bytes();
-        connection.exchange->session.append({input.data(), input.size()});
-        completion.buffer.release();
-        process(connection);
     }
 
-    void complete_send(const Completion &completion)
+    void reduce_send(const Completion &completion)
     {
         auto &connection = *completion.connection;
         const auto result = completion.result;
         telemetry.send_completed(completion);
         // Fatal and shutdown completions have already started closing in the reactor
-        if (connection.io_closing())
+        if (connection.closing())
         {
             return;
         }
         if (result < 0)
         {
-            send(connection);
-
+            connection.send_ready = true;
             return;
         }
         auto &exchange = *connection.exchange;
         if (!exchange.reply.advance(static_cast<std::size_t>(result)))
         {
-            send(connection);
-
+            connection.send_ready = true;
             return;
         }
         if (connection.close_after)
         {
-            reactor.close(connection);
-
+            close(connection);
             return;
         }
         exchange.reply.reset();
         exchange.session.reset();
-        if (exchange.session.has_input())
+        connection.finish_response();
+        // EOF is reduced before ingestion, so later records can still carry ordered input
+        if (!exchange.session.has_input() && !connection.input.count && !connection.rx_eof)
         {
-            process(connection);
-
-            return;
+            connection.ring.recycle_exchange(std::move(connection.exchange));
         }
-        connection.ring.recycle_exchange(std::move(connection.exchange));
-        reactor.receive(connection);
     }
 
-    void complete(Completion &completion)
+    void schedule(Connection &connection, WorkReason reason)
     {
-        switch (completion.kind)
+        if (!reactor.schedule(connection, reason))
         {
-        case CompletionKind::control:
+            // CQ reservation and active-ticket ownership leave room for every new ticket
+            throw std::logic_error("ready queue capacity contract violated");
+        }
+    }
+
+    void schedule_if_ready(Connection &connection)
+    {
+        if (connection.closing() || reactor.stopping())
+        {
             return;
-        case CompletionKind::received:
-            complete_receive(completion);
+        }
+        auto reasons = WorkReason::none;
+        if (connection.send_ready && !connection.tx.busy())
+        {
+            reasons |= WorkReason::transmit;
+        }
+        if (connection.request_phase == net::RequestPhase::reading &&
+            (connection.input.count || connection.rx_eof ||
+             (connection.exchange && connection.exchange->session.has_input())))
+        {
+            reasons |= WorkReason::input;
+        }
+        if (connection.rx_paused && !connection.input.count && !connection.rx.busy() &&
+            !connection.rx_eof && !connection.receive_deferred)
+        {
+            reasons |= WorkReason::resume;
+        }
+        if (reasons != WorkReason::none)
+        {
+            schedule(connection, reasons);
+        }
+    }
+
+    void ingest(Completion &completion)
+    {
+        if (!completion.connection)
+        {
             return;
-        case CompletionKind::sent:
-            complete_send(completion);
+        }
+        auto &connection = *completion.connection;
+        if (completion.kind == CompletionKind::sent)
+        {
+            reduce_send(completion);
+        }
+        if (connection.closing() || reactor.stopping())
+        {
+            close(connection);
             return;
+        }
+        if (completion.kind == CompletionKind::received && completion.result > 0)
+        {
+            connection.ring.backlog.push(connection.input, std::move(completion.buffer));
+            connection.work_reasons |= WorkReason::input;
+            if (connection.input.count >= 2 && !connection.rx_paused)
+            {
+                connection.rx_paused = true;
+                reactor.cancel_receive(connection);
+            }
+        }
+        schedule_if_ready(connection);
+    }
+
+    bool receive_input(Connection &connection)
+    {
+        if (!connection.exchange)
+        {
+            if (!connection.input.count)
+            {
+                return false;
+            }
+            connection.exchange = connection.ring.acquire_exchange();
+        }
+        auto &session = connection.exchange->session;
+        if (session.has_input() || !connection.input.count || connection.ring.rx_slices == 256)
+        {
+            return false;
+        }
+        auto lease = connection.ring.backlog.pop(connection.input);
+        ++connection.ring.rx_slices;
+        const auto received = telemetry.receive();
+        received.attach(connection);
+        const auto input = lease.bytes();
+        session.append({input.data(), input.size()});
+
+        return true;
+    }
+
+    void finish_work(Connection &connection)
+    {
+        if (connection.closing() || reactor.stopping())
+        {
+            close(connection);
+        }
+        else
+        {
+            const bool tail = connection.exchange && connection.exchange->session.has_input();
+            if (connection.request_phase == net::RequestPhase::reading && !tail &&
+                !connection.input.count && connection.rx_eof)
+            {
+                close(connection);
+            }
+            else if (connection.rx_paused && !connection.input.count && !connection.rx.busy())
+            {
+                reactor.resume_receive(connection);
+            }
+        }
+        connection.work_active = false;
+        connection.work_reasons =
+            connection.input.count ||
+                    (connection.exchange && connection.exchange->session.has_input())
+                ? WorkReason::input
+                : WorkReason::none;
+        schedule_if_ready(connection);
+        connection.ring.try_retire(connection.id());
+    }
+
+    void run_work(net::Ring &owner)
+    {
+        auto &active = active_work[owner.index];
+        std::size_t count = 0;
+        while (owner.work_visits < 256 && count < active.size())
+        {
+            const auto key = owner.ready.pop();
+            if (!key)
+            {
+                break;
+            }
+            auto *connection = owner.connections.find(*key);
+            if (!connection)
+            {
+                continue;
+            }
+            connection->work_queued = false;
+            connection->work_active = true;
+            active[count++] = *key;
+            ++owner.work_visits;
+        }
+        const auto keys = std::span(active).first(count);
+        for (const auto key : keys)
+        {
+            auto &connection = *owner.connections.find(key);
+            if (connection.closing() || reactor.stopping())
+            {
+                close(connection);
+            }
+            else if (connection.request_phase == net::RequestPhase::reading)
+            {
+                receive_input(connection);
+            }
+        }
+        for (const auto key : keys)
+        {
+            auto &connection = *owner.connections.find(key);
+            if (!connection.closing() && !reactor.stopping() && connection.exchange &&
+                connection.request_phase == net::RequestPhase::reading)
+            {
+                process(connection);
+                if (pending_writes.commands.size() == write_batch_limit)
+                {
+                    flush_writes();
+                }
+            }
+        }
+        for (const auto key : keys)
+        {
+            auto &connection = *owner.connections.find(key);
+            if (!connection.closing() && !reactor.stopping() && connection.send_ready &&
+                !connection.tx.busy())
+            {
+                send(connection);
+            }
+            finish_work(connection);
         }
     }
 
     // Keep the application alive until reactor-owned I/O storage has retired
     Application application;
     Reactor reactor;
+    std::array<std::array<net::ConnectionKey, net::ReadyQueue::capacity>,
+               telemetry::io_ring_capacity>
+        active_work{};
 
     struct WriteBatch
     {
@@ -320,14 +526,28 @@ class Server::State
             commands.reserve(write_batch_limit);
         }
 
+        ~WriteBatch()
+        {
+            clear();
+        }
+
         void clear() noexcept
         {
             // Keep the slots, but release previous results and error strings after publishing
-            for (auto &outcome : std::span(outcomes).first(commands.size()))
+            const auto count = commands.size();
+            for (auto &outcome : std::span(outcomes).first(count))
             {
                 outcome.emplace();
             }
             commands.clear();
+            for (std::size_t index = 0; index < count; ++index)
+            {
+                responses[index] = Response{};
+                auto &connection = *connections[index];
+                connections[index] = nullptr;
+                --connection.db_refs;
+                connection.ring.try_retire(connection.id());
+            }
             resolved = false;
         }
 

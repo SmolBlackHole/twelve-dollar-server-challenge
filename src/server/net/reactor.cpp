@@ -72,7 +72,8 @@ Reactor::~Reactor()
 void Reactor::start()
 {
     accept();
-    io_uring_prep_poll_add(rings_.front()->entry(&stop_operation_), stop_.get(), POLLIN);
+    io_uring_prep_poll_add(rings_.front()->entry(OperationId::control(Event::stop)), stop_.get(),
+                           POLLIN);
 }
 
 unsigned Reactor::pending_count() const noexcept
@@ -86,8 +87,38 @@ unsigned Reactor::pending_count() const noexcept
     return count;
 }
 
+bool Reactor::has_work() const noexcept
+{
+    for (const auto &owner : rings_)
+    {
+        if (owner->pending || owner->staged_count || !owner->ready.empty() ||
+            !owner->deferred_receives.empty() || (!stopping_ && owner->accept_refill_needed) ||
+            (stopping_ && owner->shutdown_cursor < owner->connections.size()))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void Reactor::begin_turn()
 {
+    bool refill = false;
+    for (const auto &owner : rings_)
+    {
+        owner->work_visits = 0;
+        owner->rx_slices = 0;
+        if (owner->accept_refill_needed)
+        {
+            owner->accept_refill_needed = false;
+            refill = true;
+        }
+    }
+    if (refill)
+    {
+        accept();
+    }
     int result;
     do
     {
@@ -111,14 +142,7 @@ bool Reactor::next(Completion &completion)
         auto &owner = *rings_[ring_index_];
         if (!ring_started_)
         {
-            IoTelemetry::drain_started(owner);
-            // Ring never enables CQE32 or mixed CQEs, so each completion advances one entry
-            auto &cq = owner.queue.cq;
-            const auto head = *cq.khead;
-            const auto ready = io_uring_smp_load_acquire(cq.ktail) - head;
-            cq_cursor_ = {cq.cqes, cq.ring_mask, head, head + std::min(ready, 256U)};
-            drained_ = 0;
-            ring_started_ = true;
+            begin_ring(owner);
         }
         if (cq_cursor_.head == cq_cursor_.tail)
         {
@@ -126,11 +150,7 @@ bool Reactor::next(Completion &completion)
             continue;
         }
 
-        auto *cqe = &cq_cursor_.cqes[cq_cursor_.head++ & cq_cursor_.mask];
-        --owner.pending;
-        auto *operation = static_cast<Operation *>(io_uring_cqe_get_data(cqe));
-        ++drained_;
-        complete(owner, operation, cqe->res, cqe->flags, completion);
+        consume(owner, completion);
 
         return true;
     }
@@ -138,10 +158,84 @@ bool Reactor::next(Completion &completion)
     return false;
 }
 
+void Reactor::begin_ring(Ring &owner)
+{
+    IoTelemetry::drain_started(owner);
+    // Ring never enables CQE32 or mixed CQEs, so each completion advances one entry
+    auto &cq = owner.queue.cq;
+    const auto head = *cq.khead;
+    const auto ready = io_uring_smp_load_acquire(cq.ktail) - head;
+    cq_cursor_ = {cq.cqes, cq.ring_mask, head, head + std::min(ready, 256U)};
+    drained_ = 0;
+    ring_started_ = true;
+}
+
+void Reactor::consume(Ring &owner, Completion &completion)
+{
+    auto *cqe = &cq_cursor_.cqes[cq_cursor_.head++ & cq_cursor_.mask];
+    // MORE publishes another result without retiring the original SQE
+    if (!(cqe->flags & IORING_CQE_F_MORE))
+    {
+        assert(owner.pending);
+        --owner.pending;
+    }
+    const auto operation = OperationId::from_raw(io_uring_cqe_get_data64(cqe));
+    ++drained_;
+    complete(owner, operation, cqe->res, cqe->flags, completion);
+}
+
+std::span<Completion> Reactor::collect()
+{
+    while (ring_index_ < rings_.size())
+    {
+        auto &owner = *rings_[ring_index_];
+        if (!ring_started_)
+        {
+            begin_ring(owner);
+        }
+        for (unsigned index = 0; index < owner.completion_count; ++index)
+        {
+            owner.completions[index].reset();
+        }
+        owner.completion_count = 0;
+        // Reserve one possible new work ticket for every collected record
+        const auto limit = static_cast<unsigned>(owner.ready.remaining());
+        while (cq_cursor_.head != cq_cursor_.tail && owner.completion_count < limit)
+        {
+            auto &record = owner.completions[owner.completion_count++];
+            record.stage(owner);
+            consume(owner, record);
+        }
+        finish_ring();
+        if (owner.completion_count)
+        {
+            return std::span(owner.completions).first(owner.completion_count);
+        }
+    }
+
+    return {};
+}
+
+bool Reactor::schedule(Connection &connection, WorkReason reason) noexcept
+{
+    connection.work_reasons |= reason;
+    if (connection.work_queued || connection.work_active)
+    {
+        return true;
+    }
+    if (!connection.ring.ready.push(connection.id()))
+    {
+        return false;
+    }
+    connection.work_queued = true;
+
+    return true;
+}
+
 void Reactor::finish_ring()
 {
     auto &owner = *rings_[ring_index_];
-    // The caller finishes the last CQE, including a full write batch, before CQ advance
+    // Every consumed CQE has an owning result before its slot is returned to the kernel
     if (drained_)
     {
         io_uring_smp_store_release(owner.queue.cq.khead, cq_cursor_.head);
@@ -179,10 +273,14 @@ void Reactor::receive(Connection &connection)
 
 void Reactor::receive(Connection &connection, bool poll_first)
 {
-    connection.start_io(Event::receive);
-    auto *request = connection.ring.entry(&connection.operation);
-    io_uring_prep_recv(request, static_cast<int>(connection.slot.value), nullptr,
-                       ReceiveBuffers::size, 0);
+    if (connection.closing() || connection.rx_eof || connection.receive_deferred)
+    {
+        throw std::logic_error("receive has no eligible connection owner");
+    }
+    connection.rx.start();
+    auto *request = connection.ring.entry(OperationId::connection(Event::receive, connection.id()));
+    // Cursed compatibility detail: 6.8 needs zero length with selected multishot buffers
+    io_uring_prep_recv_multishot(request, static_cast<int>(connection.slot.value), nullptr, 0, 0);
     request->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
     request->buf_group = ReceiveBuffers::group;
     if (poll_first)
@@ -194,22 +292,86 @@ void Reactor::receive(Connection &connection, bool poll_first)
 
 void Reactor::send(Connection &connection, msghdr &message)
 {
-    connection.start_io(Event::send);
-    auto *request = connection.ring.entry(&connection.operation);
+    if (connection.closing())
+    {
+        throw std::logic_error("send has no live connection owner");
+    }
+    connection.tx.start();
+    auto *request = connection.ring.entry(OperationId::connection(Event::send, connection.id()));
     io_uring_prep_sendmsg(request, static_cast<int>(connection.slot.value), &message, MSG_NOSIGNAL);
     request->flags |= IOSQE_FIXED_FILE;
 }
 
 void Reactor::close(Connection &connection)
 {
-    if (connection.io_active() || connection.io_closing())
+    if (connection.closing())
     {
-        throw std::logic_error("closing a connection before its original I/O completed");
+        throw std::logic_error("duplicate connection close");
     }
-    connection.start_close();
+    connection.close_phase = ClosePhase::requested;
+    connection.receive_deferred = false;
+    connection.rx_paused = false;
+    connection.work_reasons = WorkReason::none;
+    connection.ring.backlog.clear(connection.input);
+    cancel_receive(connection);
+    cancel_send(connection);
+    advance_close(connection);
+}
+
+void Reactor::cancel_receive(Connection &connection)
+{
+    if (connection.rx.request_cancel())
+    {
+        cancel(connection.ring, OperationId::connection(Event::receive, connection.id()),
+               OperationId::connection(Event::cancel_receive, connection.id()));
+    }
+}
+
+void Reactor::cancel_send(Connection &connection)
+{
+    if (connection.tx.request_cancel())
+    {
+        cancel(connection.ring, OperationId::connection(Event::send, connection.id()),
+               OperationId::connection(Event::cancel_send, connection.id()));
+    }
+}
+
+void Reactor::resume_receive(Connection &connection)
+{
+    if (!connection.rx_paused || connection.rx.busy() || connection.rx_eof ||
+        connection.closing() || connection.input.count || connection.receive_deferred)
+    {
+        return;
+    }
+    auto &owner = connection.ring;
+    if (!owner.receive_buffers->take_retry_credits(1))
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < owner.next_receive_probe)
+        {
+            connection.receive_deferred = true;
+            owner.deferred_receives.push_back(connection.id());
+
+            return;
+        }
+        owner.next_receive_probe = now + std::chrono::milliseconds(4);
+    }
+    connection.rx_paused = false;
+    receive(connection);
+}
+
+void Reactor::advance_close(Connection &connection)
+{
+    if (connection.close_phase != ClosePhase::requested || connection.rx.busy() ||
+        connection.tx.busy())
+    {
+        return;
+    }
+    connection.close_phase = ClosePhase::shutdown;
     // Cursed kernel detail: unregistering a fixed slot can defer socket release behind other I/O
     // Send TCP EOF before close_direct drops the registration
-    auto *request = connection.ring.entry(&connection.close_operation);
+    auto *request =
+        connection.ring.entry(OperationId::connection(Event::shutdown, connection.id()));
     io_uring_prep_shutdown(request, static_cast<int>(connection.slot.value), SHUT_RDWR);
     request->flags |= IOSQE_FIXED_FILE;
 }
@@ -249,9 +411,10 @@ void Reactor::accept()
     {
         return;
     }
-    for (auto &ticket : accept_tickets_)
+    for (unsigned index = 0; index < accept_tickets_.size(); ++index)
     {
-        if (ticket.pending)
+        auto &ticket = accept_tickets_[index];
+        if (ticket.pending || ticket.cancelling)
         {
             continue;
         }
@@ -270,7 +433,8 @@ void Reactor::accept()
             {
                 return;
             }
-            auto owner = std::make_unique<Ring>(table_size_, false);
+            auto owner =
+                std::make_unique<Ring>(table_size_, false, static_cast<unsigned>(rings_.size()));
             accepting = owner.get();
             rings_.push_back(std::move(owner));
             arm_wake(*accepting);
@@ -278,8 +442,9 @@ void Reactor::accept()
         ticket.ring = accepting;
         ticket.slot = accepting->connections.reserve();
         ticket.pending = true;
-        io_uring_prep_accept_direct(accepting->entry(&ticket.operation), listener_.get(), nullptr,
-                                    nullptr, SOCK_NONBLOCK, ticket.slot.value);
+        io_uring_prep_accept_direct(accepting->entry(OperationId::control(Event::accept, index)),
+                                    listener_.get(), nullptr, nullptr, SOCK_NONBLOCK,
+                                    ticket.slot.value);
     }
 }
 
@@ -287,8 +452,9 @@ void Reactor::arm_wake(Ring &owner)
 {
     // Let the pending read sleep in io_uring instead of polling and issuing another syscall
     owner.wake_counter = 0;
-    io_uring_prep_read(rings_.front()->entry(&owner.wake_operation), owner.notification->get(),
-                       &owner.wake_counter, sizeof(owner.wake_counter), 0);
+    io_uring_prep_read(rings_.front()->entry(OperationId::control(Event::wake, owner.index)),
+                       owner.notification->get(), &owner.wake_counter, sizeof(owner.wake_counter),
+                       0);
     owner.wake_pending = true;
 }
 
@@ -298,42 +464,52 @@ void Reactor::retry_receives(Ring &owner)
     {
         return;
     }
-    const auto limit = static_cast<unsigned>(
-        std::min(owner.deferred_receives.size(), static_cast<std::size_t>(256)));
-    auto count = owner.receive_buffers->take_retry_credits(limit);
     const auto now = std::chrono::steady_clock::now();
-    if (!count)
+    for (unsigned scanned = 0; scanned < 256 && !owner.deferred_receives.empty(); ++scanned)
     {
-        if (now < owner.next_receive_probe)
+        const auto key = owner.deferred_receives.front();
+        auto *connection = owner.connections.find(key);
+        if (!connection || !connection->receive_deferred || connection->closing() ||
+            connection->rx_eof || connection->rx.busy() ||
+            (connection->rx_paused && connection->input.count))
         {
-            return;
+            owner.deferred_receives.pop_front();
+            if (connection)
+            {
+                connection->receive_deferred = false;
+            }
+            continue;
         }
-        // One probe preserves progress when credits were spent on receives that used no buffer
-        count = 1;
-    }
-    owner.next_receive_probe = now + std::chrono::milliseconds(4);
-    for (unsigned index = 0; index < count; ++index)
-    {
-        auto *connection = owner.deferred_receives.front();
+        if (!owner.receive_buffers->take_retry_credits(1) && now < owner.next_receive_probe)
+        {
+            break;
+        }
+        // Stale queue entries spend no credit; a quiet ring gets one timed probe
+        owner.next_receive_probe = now + std::chrono::milliseconds(4);
         owner.deferred_receives.pop_front();
+        connection->receive_deferred = false;
+        connection->rx_paused = false;
         // Try deferred receives before arming another poll; empty sockets use normal fallback
         receive(*connection, false);
     }
 }
 
-void Reactor::cancel(Ring &owner, Operation &operation)
+void Reactor::cancel(Ring &owner, OperationId original, OperationId acknowledgement)
 {
-    io_uring_prep_cancel(owner.entry(nullptr), &operation, 0);
+    io_uring_prep_cancel64(owner.entry(acknowledgement), original.raw(), 0);
 }
 
 void Reactor::stop_all()
 {
     stopping_ = true;
-    for (auto &ticket : accept_tickets_)
+    for (unsigned index = 0; index < accept_tickets_.size(); ++index)
     {
+        auto &ticket = accept_tickets_[index];
         if (ticket.pending)
         {
-            cancel(*ticket.ring, ticket.operation);
+            ticket.cancelling = true;
+            cancel(*ticket.ring, OperationId::control(Event::accept, index),
+                   OperationId::control(Event::cancel_accept, index));
         }
     }
     for (const auto &owner : rings_)
@@ -354,13 +530,9 @@ void Reactor::advance_shutdown(Ring &owner)
             continue;
         }
         ++count;
-        if (connection->io_idle())
+        if (!connection->closing() && connection->request_phase != RequestPhase::queued_write)
         {
             close(*connection);
-        }
-        else if (connection->io_active())
-        {
-            cancel(owner, connection->operation);
         }
     }
 }
@@ -418,10 +590,14 @@ void Reactor::complete_shutdown(Connection &connection, int result)
     {
         throw std::system_error(-result, std::generic_category(), "shutdown direct socket");
     }
-    // Reuse this stable operation only after its shutdown CQE has arrived
-    connection.close_operation.event = Event::close;
-    io_uring_prep_close_direct(connection.ring.entry(&connection.close_operation),
-                               connection.slot.value);
+    if (connection.close_phase != ClosePhase::shutdown)
+    {
+        throw std::logic_error("shutdown completion has no live owner");
+    }
+    connection.close_phase = ClosePhase::close;
+    io_uring_prep_close_direct(
+        connection.ring.entry(OperationId::connection(Event::close, connection.id())),
+        connection.slot.value);
 }
 
 void Reactor::complete_close(Ring &owner, Connection &connection, int result)
@@ -430,13 +606,24 @@ void Reactor::complete_close(Ring &owner, Connection &connection, int result)
     {
         throw std::system_error(-result, std::generic_category(), "close direct descriptor");
     }
-    owner.connections.retire(connection.slot);
-    accept();
+    if (connection.close_phase != ClosePhase::close)
+    {
+        throw std::logic_error("close completion has no live owner");
+    }
+    connection.close_phase = ClosePhase::complete;
+    owner.try_retire(connection.id());
 }
 
 void Reactor::complete_io(Connection &connection, Event event, int result, unsigned flags,
                           ReceiveBufferLease buffer, Completion &completion)
 {
+    const bool more = (flags & IORING_CQE_F_MORE) != 0;
+    if (more && event != Event::receive)
+    {
+        throw std::runtime_error("unexpected persistent I/O completion");
+    }
+    auto &state = event == Event::receive ? connection.rx : connection.tx;
+    state.complete(more);
     if (event == Event::send)
     {
         IoTelemetry::send_serviced(completion);
@@ -445,21 +632,51 @@ void Reactor::complete_io(Connection &connection, Event event, int result, unsig
     {
         IoTelemetry::receive_completed(connection, result);
     }
-    connection.finish_io();
     if (event == Event::send)
     {
         completion.kind = CompletionKind::sent;
         completion.connection = &connection;
         completion.result = result;
     }
-    if (!stopping_ && event == Event::receive && result == -ENOBUFS)
+    if (stopping_ || connection.closing())
     {
-        IoTelemetry::receive_deferred(connection);
-        connection.ring.deferred_receives.push_back(&connection);
+        if (!connection.closing())
+        {
+            close(connection);
+        }
+        else
+        {
+            advance_close(connection);
+        }
 
         return;
     }
-    if (stopping_ || result == 0 || (result < 0 && result != -EAGAIN && result != -EINTR))
+    // Cancel ACKs and the original terminal can arrive in either order
+    // A paused receive stays paused until its owner explicitly rearms it
+    if (event == Event::receive && result == -ECANCELED && state.cancel_requested())
+    {
+        return;
+    }
+    if (event == Event::receive && result == -ENOBUFS)
+    {
+        if (!state.cancel_requested())
+        {
+            IoTelemetry::receive_deferred(connection);
+            connection.receive_deferred = true;
+            connection.ring.deferred_receives.push_back(connection.id());
+        }
+
+        return;
+    }
+    if (event == Event::receive && result == 0)
+    {
+        connection.rx_eof = true;
+        completion.kind = CompletionKind::received;
+        completion.buffer = std::move(buffer);
+
+        return;
+    }
+    if (result == 0 || (result < 0 && result != -EAGAIN && result != -EINTR))
     {
         close(connection);
 
@@ -467,7 +684,7 @@ void Reactor::complete_io(Connection &connection, Event event, int result, unsig
     }
     if (result < 0)
     {
-        if (event == Event::receive)
+        if (event == Event::receive && !state.cancel_requested())
         {
             receive(connection);
         }
@@ -481,51 +698,103 @@ void Reactor::complete_io(Connection &connection, Event event, int result, unsig
             throw std::runtime_error("invalid receive buffer result");
         }
         completion.kind = CompletionKind::received;
+        // A successful final result still ends multishot and needs a fresh receive later
+        if (!more)
+        {
+            connection.rx_paused = true;
+        }
         completion.connection = &connection;
         completion.result = result;
         completion.buffer = std::move(buffer);
     }
 }
 
-void Reactor::complete(Ring &owner, Operation *operation, int result, unsigned flags,
+void Reactor::complete(Ring &owner, OperationId operation, int result, unsigned flags,
                        Completion &completion)
 {
-    if (!operation)
-    {
-        // Anonymous cancel CQEs acknowledge cancellation, never ownership retirement
-        return;
-    }
+    completion.operation = operation;
+    completion.source = &owner;
+    completion.flags = flags;
+    completion.result = result;
     const bool selected = (flags & IORING_CQE_F_BUFFER) != 0;
     const auto id = flags >> IORING_CQE_BUFFER_SHIFT;
-    if (selected && id >= ReceiveBuffers::count)
+    if (selected &&
+        (id >= ReceiveBuffers::count || result > static_cast<int>(ReceiveBuffers::size)))
     {
         throw std::runtime_error("invalid receive buffer id");
     }
     const auto length = result > 0 ? static_cast<std::size_t>(result) : 0;
     ReceiveBufferLease buffer(selected ? owner.receive_buffers.get() : nullptr,
                               static_cast<unsigned short>(id), length);
-    switch (operation->event)
+    const auto event = operation.event();
+    if (operation.is_connection())
     {
+        auto *connection = owner.connections.find(operation.connection_key());
+        if (!connection)
+        {
+            // Stale identities still owe the provided-buffer ring its selected lease
+            return;
+        }
+        completion.hold(*connection);
+        switch (event)
+        {
+        case Event::receive:
+        case Event::send:
+            complete_io(*connection, event, result, flags, std::move(buffer), completion);
+            return;
+        case Event::cancel_receive:
+        case Event::cancel_send:
+            if (result < 0 && result != -ENOENT && result != -EALREADY)
+            {
+                throw std::system_error(-result, std::generic_category(), "cancel connection I/O");
+            }
+            (event == Event::cancel_receive ? connection->rx : connection->tx).acknowledge_cancel();
+            advance_close(*connection);
+            return;
+        case Event::shutdown:
+            complete_shutdown(*connection, result);
+            return;
+        case Event::close:
+            complete_close(owner, *connection, result);
+            return;
+        default:
+            break;
+        }
+    }
+    if (operation.generation() || (flags & IORING_CQE_F_MORE))
+    {
+        throw std::runtime_error("invalid control operation identity");
+    }
+    switch (event)
+    {
+    case Event::none:
+        return;
     case Event::stop:
         stop_all();
         return;
     case Event::wake:
-        complete_wake(operation->ring(), result);
+        complete_wake(*rings_.at(operation.index()), result);
         return;
     case Event::accept:
-        complete_accept(operation->accept_ticket(), result);
+        complete_accept(accept_tickets_.at(operation.index()), result);
         return;
-    case Event::shutdown:
-        complete_shutdown(operation->connection(), result);
+    case Event::cancel_accept:
+    case Event::cancel_wake:
+        if (result < 0 && result != -ENOENT && result != -EALREADY)
+        {
+            throw std::system_error(-result, std::generic_category(), "cancel control operation");
+        }
+        if (event == Event::cancel_accept)
+        {
+            accept_tickets_.at(operation.index()).cancelling = false;
+        }
+        else
+        {
+            rings_.at(operation.index())->wake_cancelling = false;
+        }
         return;
-    case Event::close:
-        complete_close(owner, operation->connection(), result);
-        return;
-    case Event::receive:
-    case Event::send:
-        complete_io(operation->connection(), operation->event, result, flags, std::move(buffer),
-                    completion);
-        return;
+    default:
+        throw std::runtime_error("unknown completion operation identity");
     }
 }
 
@@ -540,6 +809,14 @@ int Reactor::wait()
         if (index)
         {
             owner->submit();
+        }
+    }
+    for (const auto &owner : owners)
+    {
+        if (!owner->ready.empty() || owner->staged_count ||
+            (stopping_ && owner->shutdown_cursor < owner->connections.size()))
+        {
+            return io_uring_submit(&primary);
         }
     }
     // Cursed: an empty SQ does not mean the primary gets a day off
@@ -588,7 +865,8 @@ void Reactor::finish_wakeups()
     unsigned polls = 0;
     for (const auto &owner : rings_)
     {
-        if (owner->shutdown_cursor != owner->connections.size())
+        if (owner->shutdown_cursor != owner->connections.size() || !owner->ready.empty() ||
+            owner->staged_count)
         {
             return;
         }
@@ -604,7 +882,9 @@ void Reactor::finish_wakeups()
     {
         if (owner->wake_pending)
         {
-            cancel(*rings_.front(), owner->wake_operation);
+            owner->wake_cancelling = true;
+            cancel(*rings_.front(), OperationId::control(Event::wake, owner->index),
+                   OperationId::control(Event::cancel_wake, owner->index));
         }
     }
 }

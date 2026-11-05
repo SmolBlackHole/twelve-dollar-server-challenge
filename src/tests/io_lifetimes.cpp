@@ -30,11 +30,12 @@ namespace
 {
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
+using tds::net::ClosePhase;
 using tds::net::Completion;
 using tds::net::CompletionKind;
 using tds::net::Connection;
 using tds::net::Event;
-using tds::net::Operation;
+using tds::net::OperationId;
 using tds::net::Reactor;
 using tds::net::ReceiveBufferLease;
 using tds::net::ReceiveBuffers;
@@ -137,6 +138,11 @@ class Client
     void send_byte() const
     {
         require(::send(descriptor_, "x", 1, MSG_NOSIGNAL) == 1, "client send failed");
+    }
+
+    void finish_writing() const
+    {
+        require(::shutdown(descriptor_, SHUT_WR) == 0, "client half-close failed");
     }
 
     std::size_t drain_bytes(char expected) const
@@ -270,15 +276,15 @@ void reservation_and_record_guards()
     require(store.reserve() == spare && store.at(first.value) == address,
             "slot reuse moved a live record");
 
-    record.start_io(Event::receive);
+    record.rx.start();
     rejects(
         [&] {
             store.retire(first);
         },
         "store retired an original active operation");
-    require(store.at(first.value) == address && record.io_active(),
+    require(store.at(first.value) == address && record.rx.active(),
             "failed retirement changed the active record");
-    record.finish_io();
+    record.rx.complete();
     rejects(
         [&] {
             store.retire(first);
@@ -288,12 +294,294 @@ void reservation_and_record_guards()
 #if TDS_TELEMETRY_LEVEL >= 1
     require(store.live_count() == 2 && store.reserved_count() == 1,
             "rejected retirement changed connection gauges");
-    record.start_close();
+#endif
+    record.close_phase = ClosePhase::complete;
     store.retire(first);
     store.release(spare);
+#if TDS_TELEMETRY_LEVEL >= 1
     require(store.live_count() == 1 && store.reserved_count() == 0,
             "terminal close or released reservation retained a diagnostic count");
 #endif
+}
+
+void request_and_retirement_contracts()
+{
+    using tds::net::RequestPhase;
+    Ring owner(1, true);
+    auto &store = owner.connections;
+    const auto slot = store.reserve();
+    auto &connection = store.create(owner, slot);
+    const auto original = connection.id();
+    require(store.find(original) == &connection && !connection.retirable(),
+            "new connection lookup or retirement state is invalid");
+    require(!store.find({slot, original.generation + 1}) &&
+                !store.find({tds::net::DirectSlot{1}, original.generation}),
+            "lookup accepted a stale generation or out-of-range slot");
+    rejects(
+        [&] {
+            connection.start_queued_write();
+        },
+        "write queued without claiming its request");
+    rejects(
+        [&] {
+            connection.finish_response();
+        },
+        "response reset without response ownership");
+    connection.claim_request();
+    rejects(
+        [&] {
+            connection.claim_request();
+        },
+        "completed request was claimed twice");
+    connection.start_queued_write();
+    rejects(
+        [&] {
+            connection.claim_request();
+        },
+        "queued write was claimed twice");
+    rejects(
+        [&] {
+            connection.start_queued_write();
+        },
+        "same write was enqueued twice");
+    connection.close_phase = ClosePhase::complete;
+    rejects(
+        [&] {
+            store.retire(slot);
+        },
+        "retirement discarded a queued database write");
+    connection.start_response();
+    rejects(
+        [&] {
+            connection.claim_request();
+        },
+        "response preparation released the request claim");
+    rejects(
+        [&] {
+            connection.start_response();
+        },
+        "response storage was prepared twice");
+    connection.rx.start();
+    connection.tx.start();
+    connection.rx.complete(true);
+    connection.tx.complete();
+    require(connection.request_phase == RequestPhase::responding && !connection.retirable(),
+            "TX completion released the request or a live RX operation");
+    connection.tx.start();
+    require(connection.rx.request_cancel() && connection.tx.request_cancel(),
+            "independent original operations did not accept cancellation");
+    connection.rx.complete();
+    connection.tx.acknowledge_cancel();
+    require(!connection.retirable(), "retirement ignored opposite cancel completion orders");
+    rejects(
+        [&] {
+            store.retire(slot);
+        },
+        "record retired before both cancellation pairs ended");
+    connection.rx.acknowledge_cancel();
+    require(!connection.retirable(), "record retired before the original send terminal");
+    connection.tx.complete();
+    connection.finish_response();
+    require(connection.request_phase == RequestPhase::reading && connection.retirable(),
+            "resolved response did not release its claim or retirement pins");
+    connection.db_refs = 1;
+    rejects(
+        [&] {
+            store.retire(slot);
+        },
+        "retirement ignored a database batch reference");
+    connection.db_refs = 0;
+    connection.work_queued = true;
+    rejects(
+        [&] {
+            store.retire(slot);
+        },
+        "retirement ignored a queued work ticket");
+    connection.work_queued = false;
+    connection.work_active = true;
+    rejects(
+        [&] {
+            store.retire(slot);
+        },
+        "retirement ignored an active work visit");
+    connection.work_active = false;
+    store.retire(slot);
+    require(!store.find(original), "retired connection remained addressable by its handle");
+    const auto reused = store.reserve();
+    require(reused == slot, "retired slot was not reusable");
+    auto &replacement = store.create(owner, reused);
+    require(replacement.id().generation == original.generation + 1 && !store.find(original) &&
+                store.find(replacement.id()) == &replacement,
+            "slot reuse failed to advance its generation or rejected the new handle");
+    replacement.claim_request();
+    replacement.start_queued_write();
+    replacement.abandon_request();
+    require(replacement.request_phase == RequestPhase::reading,
+            "resolved database failure retained the request claim");
+    replacement.close_phase = ClosePhase::complete;
+    store.retire(reused);
+}
+
+void held_completion_defers_retirement()
+{
+    FileLimit limited(128);
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    const auto key = connection.id();
+    auto &store = connection.ring.connections;
+    Completion held;
+    peer.send_byte();
+    while (!held.connection)
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        for (auto records = reactor.collect(); !records.empty(); records = reactor.collect())
+        {
+            for (auto &completion : records)
+            {
+                if (completion.kind == CompletionKind::received)
+                {
+                    held = std::move(completion);
+                }
+                completion.reset();
+            }
+        }
+        reactor.finish_turn();
+    }
+    require(held.connection == &connection && connection.completion_refs == 1 &&
+                held.buffer.bytes().front() == 'x',
+            "moving a completion lost its connection pin or selected storage");
+    reactor.close(connection);
+    while (true)
+    {
+        const auto *current = store.find(key);
+        require(current, "close retired a connection still owned by a held completion");
+        if (current->close_phase == ClosePhase::complete)
+        {
+            break;
+        }
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+    require(held.connection == store.find(key) && held.buffer.bytes().front() == 'x',
+            "close invalidated an earlier collected completion");
+    rejects(
+        [&] {
+            store.retire(key.slot);
+        },
+        "store ignored a held completion reference");
+    held.reset();
+    require(!store.find(key), "releasing the final completion pin did not retire the connection");
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+}
+
+void full_ready_preserves_cq_and_stop_progress()
+{
+    using tds::net::ConnectionKey;
+    using tds::net::ReadyQueue;
+    using tds::net::WorkReason;
+    FileLimit limited(512);
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    auto &owner = connection.ring;
+    require(reactor.schedule(connection, WorkReason::input) &&
+                reactor.schedule(connection, WorkReason::transmit) && owner.ready.size() == 1 &&
+                connection.work_reasons == (WorkReason::input | WorkReason::transmit),
+            "duplicate readiness created another ticket or lost its reason");
+    std::vector<ConnectionKey> synthetic;
+    for (unsigned index = 1; index < ReadyQueue::capacity; ++index)
+    {
+        auto &record = owner.connections.create(owner, owner.connections.reserve());
+        synthetic.push_back(record.id());
+        require(reactor.schedule(record, WorkReason::close),
+                "ready fixture rejected available space");
+    }
+    auto &overflow = owner.connections.create(owner, owner.connections.reserve());
+    const auto overflow_key = overflow.id();
+    require(!reactor.schedule(overflow, WorkReason::close) && !overflow.work_queued &&
+                overflow.work_reasons == WorkReason::close &&
+                owner.ready.size() == ReadyQueue::capacity,
+            "ready saturation silently lost a reason, ticket or its bound");
+    reactor.request_stop();
+    await_completion(reactor, deadline);
+    const auto head = io_uring_smp_load_acquire(owner.queue.cq.khead);
+    reactor.begin_turn();
+    require(reactor.collect().empty() && io_uring_smp_load_acquire(owner.queue.cq.khead) == head &&
+                !reactor.stopping(),
+            "full work queue consumed a CQE without space for its possible work ticket");
+    reactor.finish_turn();
+
+    unsigned visits = 0;
+    while (const auto key = owner.ready.pop())
+    {
+        auto *record = owner.connections.find(*key);
+        require(record && record->work_queued, "ready queue lost its connection membership");
+        record->work_queued = false;
+        record->work_active = true;
+        const auto remaining = owner.ready.size();
+        require(reactor.schedule(*record, WorkReason::resume) && owner.ready.size() == remaining,
+                "active visit submitted a duplicate work ticket");
+        record->work_active = false;
+        record->work_reasons = WorkReason::none;
+        ++visits;
+    }
+    require(visits == ReadyQueue::capacity,
+            "full work queue required unbounded visits to make room");
+    // Synthetic records exercise registry work ownership without registering sockets
+    synthetic.push_back(overflow_key);
+    for (const auto key : synthetic)
+    {
+        auto *record = owner.connections.find(key);
+        require(record, "synthetic ready record retired before its work was released");
+        record->close_phase = ClosePhase::complete;
+        require(owner.try_retire(key), "released synthetic work still pinned retirement");
+    }
+    reactor.begin_turn();
+    unsigned stop_records = 0;
+    for (auto records = reactor.collect(); !records.empty(); records = reactor.collect())
+    {
+        for (auto &record : records)
+        {
+            stop_records += record.operation.event() == Event::stop;
+            record.reset();
+        }
+    }
+    reactor.finish_turn();
+    require(reactor.stopping() && stop_records == 1,
+            "stop did not progress after one bounded full-queue visit budget");
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
 }
 
 void satellite_wake_read_lifetime()
@@ -329,7 +617,7 @@ void satellite_wake_read_lifetime()
         }
         for (unsigned index = 0; index < burst; ++index)
         {
-            io_uring_prep_nop(satellite.entry(nullptr));
+            io_uring_prep_nop(satellite.entry({}));
         }
         satellite.submit();
         require(io_uring_cq_ready(&satellite.queue) == burst,
@@ -349,7 +637,8 @@ void satellite_wake_read_lifetime()
         }
         io_uring_cqe *wake = nullptr;
         require(io_uring_peek_cqe(&primary.queue, &wake) == 0 &&
-                    io_uring_cqe_get_data(wake) == &satellite.wake_operation &&
+                    OperationId::from_raw(io_uring_cqe_get_data64(wake)).event() == Event::wake &&
+                    OperationId::from_raw(io_uring_cqe_get_data64(wake)).index() == 1 &&
                     wake->res == static_cast<int>(sizeof(satellite.wake_counter)) &&
                     wake->flags == 0 && satellite.wake_counter > 0 &&
                     satellite.wake_counter <= burst,
@@ -470,7 +759,7 @@ void primary_progress_with_ready_satellite()
     const auto add_satellite_completions = [&](unsigned count) {
         for (unsigned index = 0; index < count; ++index)
         {
-            io_uring_prep_nop(satellite.entry(nullptr));
+            io_uring_prep_nop(satellite.entry({}));
         }
         satellite.submit();
     };
@@ -595,7 +884,7 @@ void primary_progress_with_ready_satellite()
         require(partial_send, "primary send did not exercise real socket backpressure");
 
         const auto primary_slot = connection.slot;
-        reactor.receive(connection);
+        require(connection.rx.active(), "persistent RX ended during partial-send progress");
         reactor.request_stop();
         const auto stop_deadline = Clock::now() + 2s;
         while (!reactor.stopping() || primary.connections.at(primary_slot.value))
@@ -627,7 +916,7 @@ void prime_primary_hot_turn(Reactor &reactor)
             "primary timed-wait fixture requires extended arguments");
     for (unsigned index = 0; index < 2; ++index)
     {
-        io_uring_prep_nop(primary.entry(nullptr));
+        io_uring_prep_nop(primary.entry({}));
     }
     primary.submit();
     const auto deadline = Clock::now() + 2s;
@@ -727,7 +1016,7 @@ void primary_progress_after_hot_turn()
     }
 
     prime_primary_hot_turn(reactor);
-    reactor.receive(connection);
+    require(connection.rx.active(), "persistent RX ended during sparse send progress");
     reactor.request_stop();
     sparse_turn([](const Completion &completion) {
         require(completion.kind == CompletionKind::control,
@@ -843,7 +1132,7 @@ void fixed_cq_order_and_growth()
     const auto add_nops = [](Ring &ring, unsigned count) {
         for (unsigned index = 0; index < count; ++index)
         {
-            io_uring_prep_nop(ring.entry(nullptr));
+            io_uring_prep_nop(ring.entry({}));
         }
         ring.submit();
     };
@@ -869,9 +1158,9 @@ void fixed_cq_order_and_growth()
             io_uring_cqe *cqe;
             io_uring_for_each_cqe(&ring->queue, head, cqe)
             {
-                auto *operation = static_cast<Operation *>(io_uring_cqe_get_data(cqe));
-                accept_ready = accept_ready ||
-                               (operation && operation->event == Event::accept && cqe->res >= 0);
+                const auto operation = OperationId::from_raw(io_uring_cqe_get_data64(cqe));
+                accept_ready =
+                    accept_ready || (operation.event() == Event::accept && cqe->res >= 0);
             }
         }
         require(Clock::now() < deadline, "accept CQE was not ready before the growth turn");
@@ -942,7 +1231,7 @@ void cq_wrap_and_last_consumer_publication()
     const auto publish = [&](unsigned count) {
         for (unsigned index = 0; index < count; ++index)
         {
-            io_uring_prep_nop(primary.entry(nullptr));
+            io_uring_prep_nop(primary.entry({}));
         }
         int result;
         do
@@ -1025,18 +1314,19 @@ void exhausted_receive_retries()
     {
         client->send_byte();
     }
-    // Keep every selected buffer in its CQE until the kernel has exhausted the whole pool
-    while (io_uring_cq_ready(&owner.queue) < clients_count && Clock::now() < deadline)
-    {
-        const int result = io_uring_get_events(&owner.queue);
-        require(result >= 0 || result == -EINTR, "exhaustion get events failed");
-    }
-    require(io_uring_cq_ready(&owner.queue) == clients_count, "initial receives did not complete");
     std::vector<ReceiveBufferLease> held;
     held.reserve(ReceiveBuffers::count);
     std::vector<bool> received(owner.connections.size());
     unsigned total_received = 0;
+    unsigned terminal_receives = 0;
     const auto retain = [&](Completion &completion) {
+        if (completion.operation.event() == Event::receive &&
+            !(completion.flags & IORING_CQE_F_MORE))
+        {
+            require(completion.result == -ENOBUFS,
+                    "pool exhaustion produced an unexpected receive terminal");
+            ++terminal_receives;
+        }
         if (completion.kind != CompletionKind::received)
         {
             require(completion.kind == CompletionKind::control, "unexpected exhaustion send");
@@ -1045,6 +1335,7 @@ void exhausted_receive_retries()
         }
         const auto slot = completion.connection->slot.value;
         require(!received[slot] && completion.result == 1 &&
+                    (completion.flags & IORING_CQE_F_MORE) &&
                     completion.buffer.bytes().front() == 'x',
                 "exhaustion duplicated or corrupted a receive");
         received[slot] = true;
@@ -1055,9 +1346,12 @@ void exhausted_receive_retries()
 #endif
         held.push_back(std::move(completion.buffer));
     };
-    // Six bounded CQ drains consume the original 1,536 completions without returning buffers
-    for (unsigned turn = 0; turn < clients_count / 256; ++turn)
+    // MORE data and original ENOBUFS terminals are distinct CQEs
+    while (held.size() != ReceiveBuffers::count ||
+           owner.deferred_receives.size() < clients_count - ReceiveBuffers::count ||
+           io_uring_cq_ready(&owner.queue))
     {
+        await_completion(reactor, deadline);
         reactor.begin_turn();
         drain_turn(reactor, retain);
     }
@@ -1072,13 +1366,13 @@ void exhausted_receive_retries()
             first_deferred.emplace_back(connection, connection->receive_enobufs_since_ns);
         }
     }
-    require(first_deferred.size() == clients_count - ReceiveBuffers::count &&
+    require(first_deferred.size() >= clients_count - ReceiveBuffers::count &&
                 owner.statistics.interval.enobufs_to_successful_receive_service_ns.count() == 0,
             "first ENOBUFS timestamps missed deferrals or recorded unfinished recovery");
 #endif
 
     const auto control_turn = [&](const auto &handler) {
-        io_uring_prep_nop(owner.entry(nullptr));
+        io_uring_prep_nop(owner.entry({}));
         await_completion(reactor, deadline);
         reactor.begin_turn();
         drain_turn(reactor, handler);
@@ -1088,9 +1382,10 @@ void exhausted_receive_retries()
     const auto started = Clock::now();
     for (unsigned turn = 0; turn < control_turns; ++turn)
     {
-        control_turn([&](const Completion &completion) {
+        control_turn([&](Completion &completion) {
             require(completion.kind == CompletionKind::control,
                     "a receive completed without an available buffer");
+            retain(completion);
             ++control_cqes;
         });
     }
@@ -1102,10 +1397,12 @@ void exhausted_receive_retries()
             "exhausted receive retries kept generating CQEs without buffer progress");
 
     // No refill yet: a bounded probe must still run, rather than parking the FIFO forever
+    const auto before_probe = terminal_receives;
     std::this_thread::sleep_for(5ms);
     control_turn(retain);
-    require(owner.deferred_receives.size() == clients_count - ReceiveBuffers::count - 1,
-            "timed retry did not arm exactly one exhausted receive");
+    control_turn(retain);
+    require(terminal_receives > before_probe,
+            "timed retry never probed an exhausted receive without returned buffers");
 #if TDS_TELEMETRY_LEVEL == 2
     for (const auto &[connection, first] : first_deferred)
     {
@@ -1120,19 +1417,23 @@ void exhausted_receive_retries()
     {
         control_turn(retain);
     }
-    require(owner.deferred_receives.empty() && held.size() == 512,
-            "one refill did not resume all deferred receives across bounded turns");
+    require(held.size() == clients_count - ReceiveBuffers::count,
+            "one refill did not recover every client's queued input across bounded turns");
 #if TDS_TELEMETRY_LEVEL >= 1
+    unsigned active_receives = 0;
+    for (std::size_t slot = 0; slot < owner.connections.size(); ++slot)
+    {
+        const auto *connection = owner.connections.at(slot);
+        active_receives += connection && connection->rx.active();
+    }
     require(owner.statistics.totals.receive_enobufs >= clients_count - ReceiveBuffers::count &&
-                owner.statistics.totals.receive_completions ==
-                    clients_count + owner.statistics.totals.receive_enobufs &&
-                owner.statistics.totals.receive_submissions ==
-                    owner.statistics.totals.receive_completions,
-            "receive counters included control CQEs or missed retry completions");
+                owner.statistics.totals.receive_completions == clients_count + terminal_receives &&
+                owner.statistics.totals.receive_submissions == terminal_receives + active_receives,
+            "receive counters confused MORE data, original terminals or control CQEs");
 #endif
 #if TDS_TELEMETRY_LEVEL == 2
     require(owner.statistics.interval.enobufs_to_successful_receive_service_ns.count() ==
-                    first_deferred.size() &&
+                    clients_count - ReceiveBuffers::count &&
                 owner.statistics.interval.enobufs_to_successful_receive_service_ns.max >= 5'000'000,
             "recovery timing missed an episode or excluded the buffer-deferred wait");
 #endif
@@ -1145,6 +1446,618 @@ void exhausted_receive_retries()
         drain_turn(reactor, [](const Completion &completion) {
             require(completion.kind == CompletionKind::control,
                     "exhaustion shutdown reached application I/O");
+        });
+    }
+}
+
+void transient_receive_preserves_kind_and_cancel_intent()
+{
+    FileLimit limited(128);
+    for (const int error : {-EAGAIN, -EINTR})
+    {
+        // Mode zero retries normally; the other modes force both cancellation CQE orders
+        for (const unsigned cancel_order : {0U, 1U, 2U})
+        {
+            Reactor reactor("127.0.0.1", 0);
+            reactor.start();
+            Client peer(reactor.port());
+            const auto deadline = Clock::now() + 5s;
+            await_completion(reactor, deadline);
+            reactor.begin_turn();
+            drain_turn(reactor, [](const Completion &) {
+            });
+            auto &connection = only_connection(reactor);
+            auto &owner = connection.ring;
+            reactor.cancel_receive(connection);
+            while (connection.rx.busy())
+            {
+                await_completion(reactor, deadline);
+                reactor.begin_turn();
+                drain_turn(reactor, [](const Completion &) {
+                });
+            }
+            const auto quiet_pending = owner.pending;
+            const auto original = OperationId::connection(Event::receive, connection.id());
+            connection.rx.start();
+            io_uring_prep_nop(owner.entry(original));
+            owner.submit();
+            const auto await_cqes = [&](unsigned count) {
+                while (io_uring_cq_ready(&owner.queue) < count)
+                {
+                    require(Clock::now() < deadline, "transient receive injection timed out");
+                    require(io_uring_get_events(&owner.queue) >= 0,
+                            "collect transient receive injection CQEs");
+                }
+            };
+            await_cqes(1);
+            if (cancel_order)
+            {
+                // The NOP is terminal already, so cancellation acknowledges ENOENT
+                reactor.cancel_receive(connection);
+                owner.submit();
+                await_cqes(2);
+            }
+            io_uring_cqe *receive = nullptr;
+            io_uring_cqe *acknowledgement = nullptr;
+            unsigned cursor;
+            io_uring_cqe *cqe;
+            io_uring_for_each_cqe(&owner.queue, cursor, cqe)
+            {
+                const auto event = OperationId::from_raw(cqe->user_data).event();
+                if (event == Event::receive)
+                {
+                    receive = cqe;
+                }
+                if (event == Event::cancel_receive)
+                {
+                    acknowledgement = cqe;
+                }
+            }
+            require(receive && receive->res == 0 && receive->flags == 0,
+                    "transient receive fixture did not complete its tagged NOP");
+            receive->res = error;
+            if (cancel_order)
+            {
+                require(acknowledgement && acknowledgement->res == -ENOENT,
+                        "terminal NOP cancellation did not acknowledge ENOENT");
+                const bool acknowledgement_first = cancel_order == 2;
+                io_uring_cqe *first = nullptr;
+                require(io_uring_peek_cqe(&owner.queue, &first) == 0,
+                        "transient receive CQEs disappeared before reordering");
+                if ((first == acknowledgement) != acknowledgement_first)
+                {
+                    std::swap(*receive, *acknowledgement);
+                }
+            }
+            reactor.begin_turn();
+            unsigned completions = 0;
+            drain_turn(reactor, [&](const Completion &) {
+                ++completions;
+            });
+            if (cancel_order)
+            {
+                require(completions == 2 && !connection.rx.busy() &&
+                            connection.rx.cancel_requested() && owner.pending == quiet_pending &&
+                            io_uring_sq_ready(&owner.queue) == 0,
+                        "transient cancellation lost intent or submitted a replacement receive");
+            }
+            else
+            {
+                require(completions == 1 && connection.rx.active() &&
+                            !connection.rx.cancel_requested() && owner.pending == quiet_pending + 1,
+                        "transient receive failed to rearm exactly one original");
+                peer.send_byte();
+                await_completion(reactor, deadline);
+                reactor.begin_turn();
+                bool received = false;
+                drain_turn(reactor, [&](const Completion &completion) {
+                    if (completion.kind == CompletionKind::received)
+                    {
+                        require(completion.result == 1 &&
+                                    completion.buffer.bytes().front() == 'x' &&
+                                    (completion.flags & IORING_CQE_F_MORE),
+                                "transient retry did not submit a genuine multishot receive");
+                        received = true;
+                    }
+                });
+                require(received && connection.rx.active(), "multishot retry lost persistent RX");
+            }
+            reactor.request_stop();
+            while (reactor.pending_count())
+            {
+                await_completion(reactor, deadline);
+                reactor.begin_turn();
+                drain_turn(reactor, [](Completion &completion) {
+                    completion.buffer.release();
+                });
+            }
+        }
+    }
+}
+
+void successful_terminal_receive_resumes_after_consumption()
+{
+    FileLimit limited(128);
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    auto &owner = connection.ring;
+    reactor.cancel_receive(connection);
+    while (connection.rx.busy())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](const Completion &) {
+        });
+    }
+    const auto quiet_pending = owner.pending;
+    owner.receive_buffers->take_retry_credits(ReceiveBuffers::count);
+    connection.rx.start();
+    auto *request = owner.entry(OperationId::connection(Event::receive, connection.id()));
+    // A real one-shot SQE supplies a successful terminal without changing live multishot flags
+    io_uring_prep_recv(request, static_cast<int>(connection.slot.value), nullptr,
+                       ReceiveBuffers::size, 0);
+    request->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
+    request->buf_group = ReceiveBuffers::group;
+    peer.send_byte();
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    unsigned received = 0;
+    for (auto records = reactor.collect(); !records.empty(); records = reactor.collect())
+    {
+        for (auto &completion : records)
+        {
+            if (completion.kind == CompletionKind::received)
+            {
+                require(completion.connection == &connection && completion.result == 1 &&
+                            !(completion.flags & IORING_CQE_F_MORE),
+                        "positive terminal fixture did not produce a genuine terminal receive");
+                owner.backlog.push(connection.input, std::move(completion.buffer));
+                ++received;
+            }
+            completion.reset();
+        }
+    }
+    reactor.finish_turn();
+    require(received == 1 && !connection.rx.busy() && connection.rx_paused &&
+                connection.input.count == 1 && owner.pending == quiet_pending,
+            "successful RX terminal was not accounted once and marked for resume");
+    reactor.resume_receive(connection);
+    require(!connection.rx.busy() && owner.pending == quiet_pending,
+            "terminal receive rearmed before its queued data was consumed");
+    auto lease = owner.backlog.pop(connection.input);
+    require(lease && lease.bytes().size() == 1 && lease.bytes().front() == 'x',
+            "successful terminal lost its selected input during handoff");
+    lease.release();
+    reactor.resume_receive(connection);
+    reactor.resume_receive(connection);
+    require(connection.rx.active() && !connection.rx_paused && owner.pending == quiet_pending + 1 &&
+                io_uring_sq_ready(&owner.queue) == 1,
+            "consuming a positive terminal failed to arm exactly one replacement receive");
+    peer.send_byte();
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    received = 0;
+    drain_turn(reactor, [&](const Completion &completion) {
+        if (completion.kind == CompletionKind::received)
+        {
+            require(completion.result == 1 && (completion.flags & IORING_CQE_F_MORE) &&
+                        completion.buffer.bytes().front() == 'x',
+                    "positive-terminal recovery did not resume genuine persistent RX");
+            ++received;
+        }
+    });
+    require(received == 1 && connection.rx.active() && owner.pending == quiet_pending + 1,
+            "replacement RX overlapped an original or retired on MORE");
+    require(owner.receive_buffers->take_retry_credits(ReceiveBuffers::count) == 1,
+            "positive-terminal handoff or resumed data leaked or duplicated a selected buffer");
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+}
+
+void multishot_operation_lifetimes()
+{
+    FileLimit limited(128);
+    std::string payload(8192, 'y');
+    iovec vector{payload.data(), payload.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &completion) {
+        require(completion.kind == CompletionKind::control, "unexpected multishot setup data");
+    });
+    auto &connection = only_connection(reactor);
+    auto &owner = connection.ring;
+    reactor.cancel_receive(connection);
+    rejects(
+        [&] {
+            reactor.receive(connection);
+        },
+        "receive rearmed before its previous cancellation pair completed");
+    while (connection.rx.busy())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](const Completion &completion) {
+            require(completion.kind == CompletionKind::control || completion.result == -ECANCELED,
+                    "quiet cancellation exposed payload");
+        });
+    }
+
+    reactor.receive(connection);
+    const auto persistent_pending = owner.pending;
+    peer.send_byte();
+    std::vector<ReceiveBufferLease> held;
+    const auto keep_receive = [&](Completion &completion) {
+        if (completion.kind == CompletionKind::received && completion.result > 0)
+        {
+            require(completion.connection == &connection && completion.result == 1 &&
+                        completion.buffer.bytes().size() == 1 &&
+                        completion.buffer.bytes().front() == 'x',
+                    "multishot CQE lost its selected data");
+            require(completion.flags & IORING_CQE_F_MORE,
+                    "multishot data terminalized before cancellation or EOF");
+            held.push_back(std::move(completion.buffer));
+        }
+    };
+    while (held.empty())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, keep_receive);
+    }
+    require(connection.rx.active() && owner.pending == persistent_pending,
+            "MORE decremented pending count or retired the original receive");
+    reactor.send(connection, message);
+    require(connection.rx.active() && connection.tx.active(),
+            "send did not coexist with persistent RX");
+    rejects(
+        [&] {
+            reactor.send(connection, message);
+        },
+        "second send reused storage still borrowed by its original");
+    peer.send_byte();
+    owner.submit();
+    // Queue selected input before cancellation; the terminal/ack order is kernel-owned
+    while (io_uring_cq_ready(&owner.queue) < 2 && Clock::now() < deadline)
+    {
+        require(io_uring_get_events(&owner.queue) >= 0, "queue multishot input and send result");
+    }
+    reactor.cancel_receive(connection);
+    const auto after_cancel = owner.pending;
+    reactor.cancel_receive(connection);
+    require(owner.pending == after_cancel, "duplicate targeted cancellation submitted another SQE");
+    rejects(
+        [&] {
+            reactor.receive(connection);
+        },
+        "cancelled RX rearmed before original and acknowledgement completed");
+    std::size_t sent = 0;
+    while (connection.rx.busy() || connection.tx.busy() || held.size() != 2)
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [&](Completion &completion) {
+            keep_receive(completion);
+            if (completion.kind == CompletionKind::sent)
+            {
+                require(completion.connection == &connection && completion.result > 0,
+                        "concurrent send lost its connection or signed result");
+                sent += static_cast<std::size_t>(completion.result);
+            }
+        });
+    }
+    require(sent == payload.size() && owner.pending + 1 == persistent_pending,
+            "cancel pair or simultaneous TX changed terminal-only pending accounting");
+    require(peer.drain_bytes('y') == sent, "concurrent send changed its immutable payload");
+    require(held[0].bytes().front() == 'x' && held[1].bytes().front() == 'x',
+            "cancellation invalidated held selected buffers");
+    held.clear();
+    const auto key = connection.id();
+    auto &store = owner.connections;
+    reactor.receive(connection);
+    peer.finish_writing();
+    bool eof_received = false;
+    while (!eof_received)
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [&](Completion &completion) {
+            require(completion.kind == CompletionKind::control || completion.result == 0,
+                    "EOF fixture exposed unexpected payload");
+            if (completion.operation.event() == Event::receive && completion.result == 0)
+            {
+                require(completion.operation.connection_key() == key &&
+                            !(completion.flags & IORING_CQE_F_MORE),
+                        "EOF lost its identity or retained multishot MORE");
+                const auto *current = store.find(key);
+                require(current && current->rx_eof && !current->rx.busy() &&
+                            !current->rx.cancelling(),
+                        "natural EOF retained an original or cancellation acknowledgement");
+                reactor.close(*completion.connection);
+                eof_received = true;
+            }
+        });
+    }
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+}
+
+void close_live_independent_operations()
+{
+    FileLimit limited(128);
+    std::string payload(256 * 1024, 'y');
+    iovec vector{payload.data(), payload.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port(), 4096);
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    const auto key = connection.id();
+    auto &store = connection.ring.connections;
+    reactor.send(connection, message);
+    require(connection.rx.active() && connection.tx.active(),
+            "live close fixture did not own independent originals");
+    reactor.close(connection);
+    require(store.find(key) == &connection && connection.closing() && connection.rx.cancelling() &&
+                connection.tx.cancelling(),
+            "close did not pin and cancel both original operations");
+    rejects(
+        [&] {
+            store.retire(key.slot);
+        },
+        "close request retired live originals");
+    rejects(
+        [&] {
+            reactor.close(connection);
+        },
+        "live close submitted duplicate cancellation pairs");
+    while (store.find(key))
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+}
+
+void multishot_natural_exhaustion()
+{
+    FileLimit limited(128);
+    std::string payload(1, 'y');
+    iovec vector{payload.data(), payload.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    reactor.cancel_receive(connection);
+    while (connection.rx.busy())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](const Completion &) {
+        });
+    }
+    reactor.receive(connection);
+    std::vector<ReceiveBufferLease> held;
+    held.reserve(ReceiveBuffers::count);
+    bool exhausted = false;
+    while (!exhausted)
+    {
+        peer.send_byte();
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [&](Completion &completion) {
+            if (completion.kind == CompletionKind::received && completion.result > 0)
+            {
+                require(completion.result == 1 && completion.buffer.bytes().front() == 'x' &&
+                            (completion.flags & IORING_CQE_F_MORE),
+                        "exhaustion lost multishot data or MORE");
+                held.push_back(std::move(completion.buffer));
+            }
+            if (completion.operation.event() == Event::receive && completion.result == -ENOBUFS)
+            {
+                require(!(completion.flags & IORING_CQE_F_MORE) && !connection.rx.active() &&
+                            !connection.rx.cancelling() && !connection.rx.cancel_requested(),
+                        "natural ENOBUFS invented an outstanding original or cancellation");
+                exhausted = true;
+            }
+        });
+    }
+    require(held.size() == ReceiveBuffers::count,
+            "multishot exhausted before every provided buffer was retained");
+    reactor.send(connection, message);
+    bool sent = false;
+    while (!sent)
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [&](const Completion &completion) {
+            require(completion.kind != CompletionKind::received,
+                    "TX at RX exhaustion invented input without a provided buffer");
+            if (completion.kind == CompletionKind::sent)
+            {
+                require(!sent && completion.connection == &connection && completion.result == 1,
+                        "TX needed an RX lease or completed its byte count incorrectly");
+                sent = true;
+            }
+        });
+    }
+    require(peer.drain_bytes('y') == payload.size() && held.size() == ReceiveBuffers::count,
+            "TX at RX exhaustion lost bytes or released held input");
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
+        });
+    }
+    held.clear();
+}
+
+void fatal_unwind_with_live_operations_and_lease()
+{
+    struct Unwind
+    {
+    };
+
+    FileLimit limited(128);
+    std::string payload(256 * 1024, 'y');
+    iovec vector{payload.data(), payload.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    try
+    {
+        Reactor reactor("127.0.0.1", 0);
+        reactor.start();
+        Client peer(reactor.port(), 4096);
+        const auto deadline = Clock::now() + 5s;
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](const Completion &) {
+        });
+        auto &connection = only_connection(reactor);
+        peer.send_byte();
+        std::vector<ReceiveBufferLease> held;
+        while (held.empty())
+        {
+            await_completion(reactor, deadline);
+            reactor.begin_turn();
+            drain_turn(reactor, [&](Completion &completion) {
+                if (completion.kind == CompletionKind::received)
+                {
+                    held.push_back(std::move(completion.buffer));
+                }
+            });
+        }
+        require(connection.rx.active(), "fatal teardown lost persistent RX before send");
+        reactor.send(connection, message);
+        connection.ring.submit();
+        require(connection.rx.active() && connection.tx.active() &&
+                    held.front().bytes().front() == 'x',
+                "fatal teardown fixture lost live originals or selected storage");
+        // Held leases unwind before their reactor; external send storage outlives its kernel
+        throw Unwind{};
+    }
+    catch (const Unwind &)
+    {
+    }
+}
+
+void stale_selected_completion_returns_lease()
+{
+    FileLimit limited(128);
+    Reactor reactor("127.0.0.1", 0);
+    reactor.start();
+    Client peer(reactor.port());
+    const auto deadline = Clock::now() + 5s;
+    await_completion(reactor, deadline);
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &) {
+    });
+    auto &connection = only_connection(reactor);
+    auto &owner = connection.ring;
+    auto &buffers = *owner.receive_buffers;
+    require(buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "stale completion fixture already returned a buffer");
+    peer.send_byte();
+    io_uring_cqe *selected = nullptr;
+    while (!selected)
+    {
+        await_completion(reactor, deadline);
+        unsigned cursor;
+        io_uring_cqe *cqe;
+        io_uring_for_each_cqe(&owner.queue, cursor, cqe)
+        {
+            const auto operation = OperationId::from_raw(io_uring_cqe_get_data64(cqe));
+            if (operation.event() == Event::receive)
+            {
+                selected = cqe;
+                break;
+            }
+        }
+    }
+    require(selected->res == 1 && (selected->flags & IORING_CQE_F_BUFFER) &&
+                (selected->flags & IORING_CQE_F_MORE),
+            "stale completion fixture did not select persistent RX input");
+    const auto current = connection.id();
+    // Inject an unmatched generation into a real selected-buffer CQE
+    selected->user_data =
+        OperationId::connection(Event::receive, {current.slot, current.generation + 1}).raw();
+    reactor.begin_turn();
+    drain_turn(reactor, [](const Completion &completion) {
+        require(completion.kind == CompletionKind::control && !completion.connection &&
+                    completion.buffer.bytes().empty(),
+                "stale completion reached a connection or exported selected storage");
+    });
+    require(connection.rx.active() && !connection.rx_eof &&
+                owner.connections.find(current) == &connection,
+            "stale operation mutated the current connection");
+    require(buffers.take_retry_credits(ReceiveBuffers::count) == 1 &&
+                buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "stale selected buffer was leaked or returned more than once");
+    reactor.close(connection);
+    reactor.request_stop();
+    while (reactor.pending_count())
+    {
+        await_completion(reactor, deadline);
+        reactor.begin_turn();
+        drain_turn(reactor, [](Completion &completion) {
+            completion.buffer.release();
         });
     }
 }
@@ -1165,19 +2078,14 @@ void close_and_late_accept()
     auto &store = connection.ring.connections;
     const auto slot = connection.slot;
     const auto *address = &connection;
-    require(connection.io_active(), "accept did not arm the original receive");
-    rejects(
-        [&] {
-            reactor.close(connection);
-        },
-        "close accepted an outstanding original receive");
+    require(connection.rx.active(), "accept did not arm the original receive");
     rejects(
         [&] {
             store.retire(slot);
         },
         "active receive allowed slot retirement");
-    require(store.at(slot.value) == address && connection.io_active(),
-            "rejected close changed original-operation ownership");
+    require(store.at(slot.value) == address && connection.rx.active(),
+            "rejected retirement changed original-operation ownership");
 
     Client idle(reactor.port());
     await_completion(reactor, deadline);
@@ -1194,7 +2102,7 @@ void close_and_late_accept()
             idle_connection = candidate;
         }
     }
-    require(idle_connection && idle_connection->io_active(),
+    require(idle_connection && idle_connection->rx.active(),
             "idle peer did not retain its original receive in the same ring");
 
     initial.send_byte();
@@ -1217,7 +2125,7 @@ void close_and_late_accept()
                     },
                     "receive CQE retired before close CQE");
                 reactor.close(*completion.connection);
-                require(store.at(slot.value) == address && completion.connection->io_closing(),
+                require(store.at(slot.value) == address && completion.connection->closing(),
                         "submitting close retired its record before the final close CQE");
                 rejects(
                     [&] {
@@ -1236,7 +2144,7 @@ void close_and_late_accept()
             require(completion.kind == CompletionKind::control, "unexpected I/O while closing");
             if (auto *closing = store.at(slot.value))
             {
-                require(closing == address && closing->io_closing(),
+                require(closing == address && closing->closing(),
                         "intermediate close completion changed record ownership");
                 rejects(
                     [&] {
@@ -1248,7 +2156,7 @@ void close_and_late_accept()
     }
 
     // Cursed fixed-file table references can outlive close_direct's CQE and delay TCP EOF
-    require(idle_connection->io_active(), "idle receive completed before the EOF check");
+    require(idle_connection->rx.active(), "idle receive completed before the EOF check");
     require(initial.closed(Clock::now() + 1s),
             "retired connection did not deliver TCP EOF while an unrelated receive was pending");
     const auto reused = store.reserve();
@@ -1271,7 +2179,8 @@ void close_and_late_accept()
                                 completion.buffer.bytes().front() == 'x',
                             "closing another connection damaged the idle peer's receive");
                     completion.buffer.release();
-                    reactor.receive(*idle_connection);
+                    require(idle_connection->rx.active(),
+                            "another close ended the idle peer's persistent RX");
                     idle_received = true;
                 }
                 else
@@ -1290,8 +2199,8 @@ void close_and_late_accept()
     io_uring_cqe *head = nullptr;
     require(io_uring_peek_cqe(&queue, &head) == 0 && head != nullptr,
             "stop did not produce a queued CQE");
-    const auto *stop = static_cast<const Operation *>(io_uring_cqe_get_data(head));
-    require(stop && stop->event == Event::stop && head->res >= 0,
+    const auto stop = OperationId::from_raw(io_uring_cqe_get_data64(head));
+    require(stop.event() == Event::stop && head->res >= 0,
             "stop CQE was not first before late accept");
 
     Client late(reactor.port());
@@ -1304,8 +2213,8 @@ void close_and_late_accept()
         io_uring_cqe *cqe = nullptr;
         io_uring_for_each_cqe(&queue, cursor, cqe)
         {
-            const auto *operation = static_cast<const Operation *>(io_uring_cqe_get_data(cqe));
-            late_accepted |= operation && operation->event == Event::accept && cqe->res >= 0;
+            const auto operation = OperationId::from_raw(io_uring_cqe_get_data64(cqe));
+            late_accepted |= operation.event() == Event::accept && cqe->res >= 0;
         }
         if (!late_accepted)
         {
@@ -1510,7 +2419,7 @@ void telemetry_hook_contracts()
             IoTelemetry::send_serviced(completion);
             completion.connection = &connection;
             completion.result = result;
-            connection.start_close();
+            connection.close_phase = ClosePhase::requested;
             collector.send_completed(completion);
         }
 #if TDS_TELEMETRY_LEVEL == 2
@@ -1519,7 +2428,7 @@ void telemetry_hook_contracts()
                 "failed or closing sends lost samples or changed buffered receive time");
 #endif
         IoTelemetry::drain_started(owner);
-        owner.deferred_receives.push_back(&connection);
+        owner.deferred_receives.push_back(connection.id());
         IoTelemetry::drain_finished(owner, 3);
         owner.deferred_receives.pop_front();
 #if TDS_TELEMETRY_LEVEL >= 1
@@ -1742,6 +2651,9 @@ int main()
     try
     {
         reservation_and_record_guards();
+        request_and_retirement_contracts();
+        held_completion_defers_retirement();
+        full_ready_preserves_cq_and_stop_progress();
         satellite_wake_read_lifetime();
         primary_progress_with_ready_satellite();
         primary_progress_after_hot_turn();
@@ -1749,6 +2661,13 @@ int main()
         fixed_cq_order_and_growth();
         cq_wrap_and_last_consumer_publication();
         exhausted_receive_retries();
+        transient_receive_preserves_kind_and_cancel_intent();
+        successful_terminal_receive_resumes_after_consumption();
+        multishot_operation_lifetimes();
+        close_live_independent_operations();
+        multishot_natural_exhaustion();
+        fatal_unwind_with_live_operations_and_lease();
+        stale_selected_completion_returns_lease();
         close_and_late_accept();
         telemetry_hook_contracts();
 #if TDS_TELEMETRY_LEVEL == 2

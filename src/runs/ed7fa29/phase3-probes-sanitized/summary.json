@@ -1,0 +1,39 @@
+{
+  "measurement": {
+    "compiled_probes": [
+      "retry_receive_probe",
+      "receive_probe",
+      "receive_count_probe"
+    ],
+    "executed": "retry_receive_probe 1",
+    "sanitizers": true,
+    "timings_are_performance_evidence": false
+  },
+  "schema_version": 1,
+  "anchor": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+  "label": "phase3-probes-sanitized",
+  "kind": "probe",
+  "started_at": "2026-11-05T01:05:57.402380+00:00",
+  "status": "failed",
+  "finished_at": "2026-11-05T01:06:05.642244+00:00",
+  "exit_code": 1,
+  "error": "RuntimeError('retry-contract failed: 127')",
+  "secondary_errors": [],
+  "workload": {
+    "kind": "probe_contracts"
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+      "patch_sha256": "1c4010805a20c20d85f4a74b98d32927f2f61d93958ad1649df8c24635bccfe7",
+      "source_sha256": "402ba35ae516f840574ae57fe991d5d86776fac9a0098ad037816f97bd4824d2",
+      "patch": "source.patch"
+    },
+    "binary": null
+  }
+}

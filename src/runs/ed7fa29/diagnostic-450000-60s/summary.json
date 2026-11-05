@@ -1,0 +1,311 @@
+{
+  "benchmark": {
+    "date": "2026-11-04",
+    "name": "diagnostic-450000-60s",
+    "runtime": "C++ 0.1.0",
+    "load_generator": "docker_loopback",
+    "generator": "cpp",
+    "sqlite": "3.53.1",
+    "users": 450000,
+    "hold": "60s",
+    "ramp": "30s",
+    "requests": 4651914,
+    "rps": 35783.8422988,
+    "p95_ms": 47.0664032,
+    "p99_ms": 1055.57023047,
+    "max_ms": 4176.143082,
+    "error_rate": 0.0,
+    "cpu_us_per_request": 21.41410137848636,
+    "cpu_scope": "server_cgroup",
+    "server_peak_bytes": 2187317248,
+    "passed": false,
+    "client_sampled_peak_bytes": 1928957952
+  },
+  "load_generator": {
+    "name": "td-load",
+    "version": "0.1.0",
+    "seed": 20261104,
+    "vus": 450000,
+    "passed": false,
+    "checks_passed": true,
+    "workflow_errors": 0,
+    "ramp_up_seconds": 30,
+    "target_activation_seconds": 30.010555339,
+    "activation_deadline_grace_ms": 100,
+    "target_activation_on_time": true,
+    "prepared_sockets": 450000,
+    "socket_preparation_seconds": 3.197450319,
+    "duration_semantics": "send+wait+receive, excludes connection acquisition and client request preparation; interrupted requests omitted",
+    "target_concurrency_reached": true,
+    "http_response_coverage_complete": true,
+    "http_metrics_passed": false,
+    "peak_live_connections": 450000,
+    "hold_peak_live_connections": 450000,
+    "max_rss_bytes": 202936320,
+    "idle_vu_state_bytes": 88,
+    "interrupted_iterations": 232896,
+    "endpoint_requests": {
+      "feed": 2145307,
+      "post": 2145307,
+      "like": 318899,
+      "create": 42401
+    },
+    "endpoint_duration_ms": {
+      "feed": {
+        "count": 2145307,
+        "avg": 36.3609162049,
+        "p95": 49.5969265,
+        "p99": 1094.95137668,
+        "max": 4176.143082
+      },
+      "post": {
+        "count": 2145307,
+        "avg": 31.281064932,
+        "p95": 46.5971176,
+        "p99": 982.38073942,
+        "max": 4176.088025
+      },
+      "like": {
+        "count": 318899,
+        "avg": 29.5024420664,
+        "p95": 36.5186504,
+        "p99": 1007.47690582,
+        "max": 3542.774748
+      },
+      "create": {
+        "count": 42401,
+        "avg": 30.6491356772,
+        "p95": 39.054219,
+        "p99": 1025.623095,
+        "max": 3227.633432
+      }
+    },
+    "phase_duration_ms": {
+      "ramp_up": {
+        "count": 940089,
+        "avg": 4.54860081112,
+        "p95": 10.990129,
+        "p99": 22.53093696,
+        "max": 60.176371
+      },
+      "hold": {
+        "count": 2843690,
+        "avg": 45.2521633868,
+        "p95": 99.68774115,
+        "p99": 1288.29241054,
+        "max": 4176.143082
+      },
+      "ramp_down": {
+        "count": 853672,
+        "avg": 26.7138993459,
+        "p95": 37.6036002,
+        "p99": 857.89681824,
+        "max": 1171.406708
+      },
+      "grace": {
+        "count": 14463,
+        "avg": 3.90976489,
+        "p95": 7.6300865,
+        "p99": 9.79024492,
+        "max": 19.420125
+      }
+    }
+  },
+  "profile": {
+    "event": "cpu-clock",
+    "frequency_hz": 997,
+    "stack_bytes": 8192,
+    "samples": 55577,
+    "sampled_cpu_ns": 55744231193,
+    "lost_records": 0,
+    "unresolved_leaf_samples": 1943,
+    "unrooted_samples": 1385,
+    "stages_cpu_ns": {
+      "database_and_rows": 10651955580,
+      "kernel_network": 26193580035,
+      "response_json": 1706118309,
+      "kernel_scheduler": 1458375086,
+      "transport_and_other": 3166499413,
+      "auth": 835506497,
+      "kernel_filesystem": 4508525455,
+      "kernel_io_uring": 5958876469,
+      "unknown": 494483437,
+      "kernel_other": 764292858,
+      "request_json": 6018054
+    },
+    "hotspots": [
+      {
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 3608826382,
+        "samples": 3598
+      },
+      {
+        "symbol": "__inet_lookup_established",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 1956870559,
+        "samples": 1951
+      },
+      {
+        "symbol": "sqlite3BtreeTableMoveto",
+        "module": "/app/server",
+        "cpu_ns": 1647943787,
+        "samples": 1643
+      },
+      {
+        "symbol": "pcache1Fetch",
+        "module": "/app/server",
+        "cpu_ns": 1469408185,
+        "samples": 1465
+      },
+      {
+        "symbol": "irqentry_exit_to_user_mode",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 1337010997,
+        "samples": 1333
+      },
+      {
+        "symbol": "finish_task_switch.isra.0",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 1269809394,
+        "samples": 1266
+      },
+      {
+        "symbol": "[unknown]",
+        "module": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "cpu_ns": 1180541593,
+        "samples": 1177
+      },
+      {
+        "symbol": "tcp_ack",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 994984928,
+        "samples": 992
+      },
+      {
+        "symbol": "tds_btree_feed_next",
+        "module": "/app/server",
+        "cpu_ns": 924774298,
+        "samples": 922
+      },
+      {
+        "symbol": "io_issue_sqe",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 706118336,
+        "samples": 704
+      },
+      {
+        "symbol": "tds::quote(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, std::basic_string_view<char, std::char_traits<char> >)",
+        "module": "/app/server",
+        "cpu_ns": 648946823,
+        "samples": 647
+      },
+      {
+        "symbol": "sqlite3GetVarint",
+        "module": "/app/server",
+        "cpu_ns": 587763274,
+        "samples": 586
+      },
+      {
+        "symbol": "_copy_from_iter",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 579739202,
+        "samples": 578
+      },
+      {
+        "symbol": "__io_submit_flush_completions",
+        "module": "[kernel.kallsyms]",
+        "cpu_ns": 573721148,
+        "samples": 572
+      },
+      {
+        "symbol": "tds::net::Reactor::complete(tds::net::Ring&, tds::net::Operation*, int, unsigned int, tds::net::Completion&)",
+        "module": "/app/server",
+        "cpu_ns": 569709112,
+        "samples": 568
+      }
+    ],
+    "syscalls_cpu_ns": {
+      "io_uring_enter": 28997993199,
+      "other": 5195586620,
+      "pwrite64": 1584754220,
+      "pread64": 456369095,
+      "fsync": 2348044069,
+      "fadvise64": 231695079,
+      "brk": 2006018,
+      "ftruncate": 29087261,
+      "clock_gettime": 17051153,
+      "newfstat": 17051153,
+      "munmap": 1003009,
+      "futex": 3009027
+    }
+  },
+  "window": {
+    "warmup_s": 30.0,
+    "hold_s": 60.0,
+    "resume_ack_s": 0.000520800007507205,
+    "enable_request_s": 30.10767249998753,
+    "enable_ack_s": 30.195087400003104,
+    "disable_request_s": 90.06435309999506,
+    "disable_ack_s": 90.1596361999982,
+    "cpu": {
+      "cgroup_user_s": 17.306726,
+      "cgroup_system_s": 39.560098,
+      "main_user_s": 17.31,
+      "main_system_s": 39.55,
+      "cgroup_minus_main_s": 0.006824000000008823
+    }
+  },
+  "collection_errors": [
+    "requested server telemetry export is missing",
+    "server cleanup: Error response from daemon: Could not find the file /data/telemetry.jsonl in container td-bench-4bc2de3c3b"
+  ],
+  "schema_version": 1,
+  "anchor": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+  "label": "diagnostic-450000-60s",
+  "kind": "workload",
+  "started_at": "2026-11-04T23:43:23.064876+00:00",
+  "status": "failed",
+  "finished_at": "2026-11-04T23:47:15.838656+00:00",
+  "exit_code": 99,
+  "error": "load generator exited 99",
+  "secondary_errors": [
+    "requested server telemetry export is missing",
+    "server cleanup: Error response from daemon: Could not find the file /data/telemetry.jsonl in container td-bench-4bc2de3c3b",
+    "Error response from daemon: Could not find the file /data/telemetry.jsonl in container td-bench-4bc2de3c3b"
+  ],
+  "workload": {
+    "generator": "cpp",
+    "vus": 450000,
+    "ramp": "30s",
+    "hold": "60s",
+    "seed": 20261104
+  },
+  "instruments": {
+    "server_telemetry": "profile",
+    "client_diagnostics": false,
+    "perf": "all"
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+      "patch_sha256": "22157a8a15a0ac558655b3936565aa6be0e7c5ad3f9eabbf6d5ee2cd13ec73c8",
+      "source_sha256": "9fe7fa6a1c77dce08ff53c04a4f5cb43681b4084fb9912754d9182ae8ad2dfa6",
+      "patch": "source.patch"
+    },
+    "binary": {
+      "server": {
+        "image_id": "sha256:f46e450fc54d1c04b6eac8169c4680905ed7b799c1d2665e3dd90966341dd96c",
+        "sha256": "804e20409a480299a45d8e77b8edf5e97c2518d8888e521dae74b7cfa3c8f1dd"
+      },
+      "profiler": {
+        "image_id": "sha256:6bd857573326aff1312cb62ded198a4b5b28c421c750f47241b3fcaacced2add",
+        "sha256": "804e20409a480299a45d8e77b8edf5e97c2518d8888e521dae74b7cfa3c8f1dd"
+      },
+      "generator": {
+        "image_id": "sha256:6d6d6ef52fdda7a1f208a581c561a650f6695eb6fb64bc3328b26fb0ca0d4368",
+        "sha256": "f2634e9500b5017ee4c3ca77329ea8a98c54544b92e972ba9ba637fba69a4a1e"
+      }
+    }
+  }
+}

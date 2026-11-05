@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../telemetry/config.hpp"
+#include "completion.hpp"
 #include "ring.hpp"
 
 #include <array>
@@ -15,24 +16,6 @@
 namespace tds::net
 {
 
-enum class CompletionKind
-{
-    control,
-    received,
-    sent
-};
-
-struct Completion
-{
-    CompletionKind kind = CompletionKind::control;
-    Connection *connection = nullptr;
-    int result = 0;
-    ReceiveBufferLease buffer;
-#if TDS_TELEMETRY_LEVEL == 2
-    std::uint64_t serviced_ns = 0;
-#endif
-};
-
 class Reactor
 {
   public:
@@ -44,14 +27,21 @@ class Reactor
 
     void start();
     unsigned pending_count() const noexcept;
+    bool has_work() const noexcept;
     void begin_turn();
     // Consume the returned completion before next advances or retires another record
     bool next(Completion &completion);
+    // Consume and reset every record before collecting another bounded ring prefix
+    std::span<Completion> collect();
+    bool schedule(Connection &connection, WorkReason reason) noexcept;
+    void resume_receive(Connection &connection);
     void finish_turn();
 
     bool stopping() const noexcept;
     void receive(Connection &connection);
     void send(Connection &connection, msghdr &message);
+    void cancel_receive(Connection &connection);
+    void cancel_send(Connection &connection);
     void close(Connection &connection);
     void request_stop() const noexcept;
     int stop_descriptor() const noexcept;
@@ -60,10 +50,13 @@ class Reactor
 
   private:
     void receive(Connection &connection, bool poll_first);
+    void begin_ring(Ring &owner);
+    void consume(Ring &owner, Completion &completion);
     void accept();
     void arm_wake(Ring &owner);
     void retry_receives(Ring &owner);
-    void cancel(Ring &owner, Operation &operation);
+    void cancel(Ring &owner, OperationId original, OperationId acknowledgement);
+    void advance_close(Connection &connection);
     void stop_all();
     void advance_shutdown(Ring &owner);
     void complete_wake(Ring &owner, int result);
@@ -72,7 +65,7 @@ class Reactor
     void complete_close(Ring &owner, Connection &connection, int result);
     void complete_io(Connection &connection, Event event, int result, unsigned flags,
                      ReceiveBufferLease buffer, Completion &completion);
-    void complete(Ring &owner, Operation *operation, int result, unsigned flags,
+    void complete(Ring &owner, OperationId operation, int result, unsigned flags,
                   Completion &completion);
     int wait();
     void finish_ring();
@@ -89,10 +82,9 @@ class Reactor
     Descriptor listener_;
     Descriptor stop_;
     static constexpr std::size_t max_rings = telemetry::io_ring_capacity;
-    // Tickets outlive the rings that still have their addresses in CQEs
+    // Ticket indices stay stable until original accepts and issued cancel ACKs have completed
     std::array<AcceptTicket, 64> accept_tickets_;
     std::vector<std::unique_ptr<Ring>> rings_;
-    Operation stop_operation_{Event::stop};
     unsigned table_size_ = 0;
     std::uint16_t port_ = 0;
     bool stopping_ = false;

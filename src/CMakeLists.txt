@@ -41,6 +41,7 @@ tds_add_library(transport STATIC
     server/http/session.cpp
     server/http/reply.cpp
     server/net/buffers.cpp
+    server/net/completion.cpp
     server/net/connections.cpp
     server/net/ring.cpp
     server/net/reactor.cpp

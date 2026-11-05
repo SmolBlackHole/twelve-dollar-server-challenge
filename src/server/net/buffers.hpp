@@ -91,6 +91,16 @@ class ReceiveBufferLease
         return *this;
     }
 
+    explicit operator bool() const noexcept
+    {
+        return owner_ != nullptr;
+    }
+
+    unsigned short id() const noexcept
+    {
+        return id_;
+    }
+
     std::span<const char> bytes() const noexcept
     {
         if (!owner_)

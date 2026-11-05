@@ -3,9 +3,11 @@
 #include "net/ring.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace tds::bench
@@ -298,7 +300,7 @@ class ReceiveBackend
 
     io_uring_sqe *prepare(ReceiveEvent event, unsigned slot)
     {
-        auto *entry = ring_.entry(nullptr);
+        auto *entry = ring_.entry();
         io_uring_sqe_set_data64(entry, tag(event, slot));
 
         return entry;
@@ -318,6 +320,58 @@ class ReceiveBackend
     unsigned previous_count_ = 0;
     unsigned head_ = 0;
     unsigned tail_ = 0;
+};
+
+// Native cost screen: completions keep their leases until the RX consumer takes ownership
+// Declare after the backend so retained leases return before its buffer pool is destroyed
+class ReceiveHandoff
+{
+  public:
+    static constexpr unsigned capacity = 256;
+
+    ReceiveHandoff() = default;
+    ReceiveHandoff(const ReceiveHandoff &) = delete;
+    ReceiveHandoff &operator=(const ReceiveHandoff &) = delete;
+
+    unsigned collect(ReceiveBackend &backend)
+    {
+        const auto before = size_;
+        while (size_ < capacity)
+        {
+            auto &completion = completions_[(head_ + size_) % capacity];
+            if (!backend.next(completion))
+            {
+                break;
+            }
+            ++size_;
+        }
+
+        return size_ - before;
+    }
+
+    bool next(ReceiveCompletion &completion) noexcept
+    {
+        completion = {};
+        if (!size_)
+        {
+            return false;
+        }
+        completion = std::move(completions_[head_]);
+        head_ = (head_ + 1) % capacity;
+        --size_;
+
+        return true;
+    }
+
+    unsigned size() const noexcept
+    {
+        return size_;
+    }
+
+  private:
+    std::array<ReceiveCompletion, capacity> completions_;
+    unsigned head_ = 0;
+    unsigned size_ = 0;
 };
 
 } // namespace tds::bench

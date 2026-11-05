@@ -289,6 +289,7 @@ std::uint16_t listen(int socket)
     return ntohs(address.sin_port);
 }
 
+template <bool Handoff>
 void measure(ReceiveMode mode, bool idle, unsigned units, unsigned connections, ReceiveWait wait)
 {
     Descriptor listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -330,6 +331,23 @@ void measure(ReceiveMode mode, bool idle, unsigned units, unsigned connections, 
     response.msg_iov = &vector;
     response.msg_iovlen = 1;
     ReceiveBackend backend(sockets, mode, wait);
+    tds::bench::ReceiveHandoff handoff;
+    auto collect = [&] {
+        if constexpr (Handoff)
+        {
+            handoff.collect(backend);
+        }
+    };
+    auto next = [&](ReceiveCompletion &completion) {
+        if constexpr (Handoff)
+        {
+            return handoff.next(completion);
+        }
+        else
+        {
+            return backend.next(completion);
+        }
+    };
     for (unsigned slot = 0; slot < connections; ++slot)
     {
         backend.receive(slot);
@@ -369,8 +387,9 @@ void measure(ReceiveMode mode, bool idle, unsigned units, unsigned connections, 
     while (bytes < target || (idle && sent < units))
     {
         backend.begin_turn(false, !deferred.empty());
+        collect();
         ReceiveCompletion completion;
-        while (backend.next(completion))
+        while (next(completion))
         {
             const auto slot = completion.slot;
             auto &state = progress.at(slot);
@@ -478,8 +497,9 @@ void measure(ReceiveMode mode, bool idle, unsigned units, unsigned connections, 
     while (backend.pending())
     {
         backend.begin_turn(true);
+        collect();
         ReceiveCompletion completion;
-        while (backend.next(completion))
+        while (next(completion))
         {
             require((completion.event == ReceiveEvent::receive &&
                      (completion.result == 0 || completion.result == -ECANCELED ||
@@ -496,22 +516,25 @@ void measure(ReceiveMode mode, bool idle, unsigned units, unsigned connections, 
     child.join();
     require(producer.latency_samples == (idle ? units : 0), "producer RTT sample count differs");
     std::printf(
-        "{\"mode\":\"%s\",\"case\":\"%s\",\"bytes\":%llu,\"receive_cqes\":%llu,\"sends\":%llu,"
+        "{\"mode\":\"%s\",\"case\":\"%s\",\"delivery\":\"%s\",\"bytes\":%llu,\"receive_cqes\":%llu,"
+        "\"sends\":%llu,"
         "\"server_thread_cpu_ns\":%llu,\"server_user_us\":%llu,\"server_system_us\":%llu,"
-        "\"wall_ns\":%llu,\"buffer_pool_bytes\":%u,\"counted\":%d,\"receive_sqes\":%llu,"
+        "\"wall_ns\":%llu,\"buffer_pool_bytes\":%u,\"handoff_storage_bytes\":%zu,\"counted\":%d,"
+        "\"receive_sqes\":%llu,"
         "\"terminal_receive_cqes\":%llu,\"enobufs\":%llu,\"connections\":%u,"
         "\"wait_policy\":\"%s\",\"cq_wait_nr\":%u,\"timeout_ms\":%u,"
         "\"waits\":%llu,\"timeouts\":%llu,\"ready_drains\":%llu,"
         "\"producer_cpu_ns\":%llu,\"producer_wall_ns\":%llu,\"rtt_samples\":%llu,"
         "\"rtt_p50_ns\":%llu,\"rtt_p95_ns\":%llu,\"rtt_p99_ns\":%llu,\"rtt_max_ns\":%llu}\n",
         mode == ReceiveMode::multishot ? "multishot" : "one_shot",
-        idle ? "empty_pingpong" : "queued_stream", static_cast<unsigned long long>(bytes),
-        static_cast<unsigned long long>(completions), static_cast<unsigned long long>(sent),
-        static_cast<unsigned long long>(cpu),
+        idle ? "empty_pingpong" : "queued_stream", Handoff ? "handoff" : "direct",
+        static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(completions),
+        static_cast<unsigned long long>(sent), static_cast<unsigned long long>(cpu),
         static_cast<unsigned long long>(micros(after.ru_utime) - micros(before.ru_utime)),
         static_cast<unsigned long long>(micros(after.ru_stime) - micros(before.ru_stime)),
         static_cast<unsigned long long>(wall), ReceiveBuffers::count * ReceiveBuffers::size,
-        TDS_RECEIVE_COUNTS, static_cast<unsigned long long>(backend.counts.submissions),
+        Handoff ? sizeof(handoff) : std::size_t{0}, TDS_RECEIVE_COUNTS,
+        static_cast<unsigned long long>(backend.counts.submissions),
         static_cast<unsigned long long>(backend.counts.terminals),
         static_cast<unsigned long long>(backend.counts.enobufs), connections,
         wait == ReceiveWait::production    ? "batch128"
@@ -536,9 +559,9 @@ int main(int argc, char **argv)
     ::alarm(70);
     try
     {
-        require(argc >= 4 && argc <= 6,
+        require(argc >= 4 && argc <= 7,
                 "usage: receive_probe one|multi stream|idle TOTAL_UNITS [CONNECTIONS] "
-                "[batch128|ready128|ready1]");
+                "[batch128|ready128|ready1] [direct|handoff]");
         const std::string_view backend(argv[1]);
         require(backend == "one" || backend == "multi", "unknown receive backend");
         const std::string_view mode(argv[2]);
@@ -560,7 +583,7 @@ int main(int argc, char **argv)
                     "connection count must divide total units and be in 1..4096");
         }
         ReceiveWait wait = ReceiveWait::production;
-        if (argc == 6)
+        if (argc >= 6)
         {
             const std::string_view policy(argv[5]);
             require(policy == "batch128" || policy == "ready128" || policy == "ready1",
@@ -569,8 +592,25 @@ int main(int argc, char **argv)
                    : policy == "ready128" ? ReceiveWait::ready_first
                                           : ReceiveWait::ready_one;
         }
-        measure(backend == "multi" ? ReceiveMode::multishot : ReceiveMode::one_shot, mode == "idle",
-                units, connections, wait);
+        bool handoff = false;
+        if (argc == 7)
+        {
+            const std::string_view delivery(argv[6]);
+            require(delivery == "direct" || delivery == "handoff", "unknown completion delivery");
+            handoff = delivery == "handoff";
+        }
+        // Staged multishot terminals need the independent RX state from the next phase
+        require(!handoff || backend == "one", "handoff cost screen requires one-shot receive");
+        const auto receive_mode =
+            backend == "multi" ? ReceiveMode::multishot : ReceiveMode::one_shot;
+        if (handoff)
+        {
+            measure<true>(receive_mode, mode == "idle", units, connections, wait);
+        }
+        else
+        {
+            measure<false>(receive_mode, mode == "idle", units, connections, wait);
+        }
 
         return 0;
     }

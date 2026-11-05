@@ -1,0 +1,45 @@
+{
+  "measurement": {
+    "contracts": [
+      "operation_state_contract",
+      "io_lifetime_contract",
+      "transport_lifetimes",
+      "receive_backend_contract",
+      "pipeline_ownership_contract"
+    ],
+    "telemetry": "off",
+    "compiler_container": "td-operation-state",
+    "full_ctest": true
+  },
+  "schema_version": 1,
+  "anchor": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+  "label": "phase3-regressions-off",
+  "kind": "probe",
+  "started_at": "2026-11-05T00:49:50.447323+00:00",
+  "status": "passed",
+  "finished_at": "2026-11-05T00:50:11.330177+00:00",
+  "exit_code": 0,
+  "error": null,
+  "secondary_errors": [],
+  "workload": {
+    "kind": "transport_contracts"
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+      "patch_sha256": "4000773fc9ca4ee4fa9194a74d498a8775c92cc7686c9c8cd0544544c03379b7",
+      "source_sha256": "5c3f6312c66bca4fd0dbedea41e00e52b51f8bc3d4579baf1ab62b746d6633c3",
+      "patch": "source.patch"
+    },
+    "binary": {
+      "server": {
+        "sha256": "2e73c86b91de4b32605b3734a4b15c0c2c8997c799558cca4f9a19ac533d180a"
+      }
+    }
+  }
+}

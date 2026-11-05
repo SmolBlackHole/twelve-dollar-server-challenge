@@ -1,0 +1,30 @@
+{
+  "measurement": {},
+  "schema_version": 1,
+  "anchor": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+  "label": "phase2-native-off-v1",
+  "kind": "probe",
+  "started_at": "2026-11-05T00:09:49.026421+00:00",
+  "status": "failed",
+  "finished_at": "2026-11-05T00:10:25.174139+00:00",
+  "exit_code": 1,
+  "error": "RuntimeError('build failed, exit 1')",
+  "secondary_errors": [],
+  "workload": {
+    "kind": "transport_contracts"
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+      "patch_sha256": "5848d582758a01e507b5ad8ee5dbc46479b4dd0931dd978316482cfeff5deaa6",
+      "source_sha256": "7d4ec10154e03a5b6c333b5e3c4e7ae25b59b01e5c35ae6fd02a9cb34c84d26b",
+      "patch": "source.patch"
+    },
+    "binary": null
+  }
+}

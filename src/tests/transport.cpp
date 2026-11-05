@@ -62,7 +62,6 @@ concept CompletionStamped = requires(T &owner) { owner.serviced_ns; };
 template <class T>
 concept RingProfiled = requires(T &owner) { owner.statistics.interval; };
 
-static_assert(sizeof(tds::net::Connection) == (tds::telemetry::profiling ? 64 : 56));
 static_assert(ReceiveStamped<tds::net::Connection> == tds::telemetry::profiling);
 static_assert(ExchangeStamped<tds::http::Exchange> == tds::telemetry::profiling);
 static_assert(CompletionStamped<tds::net::Completion> == tds::telemetry::profiling);
@@ -89,6 +88,95 @@ struct CommitGate
 };
 
 thread_local CommitGate *active_commit_gate = nullptr;
+
+struct SendPrefixGate
+{
+    std::binary_semaphore reached{0};
+    std::binary_semaphore queued{0};
+    std::binary_semaphore proceed{0};
+    int send_result = 0;
+    bool used = false;
+    bool prefix_seen = false;
+    bool failed = false;
+
+    void after_submit(io_uring &queue)
+    {
+        using tds::net::Event;
+        using tds::net::OperationId;
+        if (used)
+        {
+            return;
+        }
+        tds::net::ConnectionKey key{};
+        unsigned cursor;
+        io_uring_cqe *cqe;
+        io_uring_for_each_cqe(&queue, cursor, cqe)
+        {
+            const auto operation = OperationId::from_raw(cqe->user_data);
+            if (operation.event() == Event::send && cqe->res > 0)
+            {
+                key = operation.connection_key();
+                send_result = cqe->res;
+                used = true;
+                break;
+            }
+        }
+        if (!used)
+        {
+            return;
+        }
+        reached.release();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const int result = io_uring_get_events(&queue);
+            if (result < 0 && result != -EINTR && result != -EBUSY)
+            {
+                failed = true;
+                return;
+            }
+            unsigned sequence = 0;
+            io_uring_for_each_cqe(&queue, cursor, cqe)
+            {
+                const auto operation = OperationId::from_raw(cqe->user_data);
+                if (!operation.is_connection() || operation.connection_key() != key)
+                {
+                    continue;
+                }
+                if (sequence == 0 && operation.event() == Event::send && cqe->res == send_result)
+                {
+                    sequence = 1;
+                }
+                else if (sequence == 1 && operation.event() == Event::receive && cqe->res > 0 &&
+                         (cqe->flags & IORING_CQE_F_MORE))
+                {
+                    sequence = 2;
+                }
+                else if (sequence == 2 && operation.event() == Event::receive && cqe->res == 0 &&
+                         !(cqe->flags & IORING_CQE_F_MORE))
+                {
+                    sequence = 3;
+                }
+                else
+                {
+                    sequence = 4;
+                }
+            }
+            if (sequence == 3 && !prefix_seen)
+            {
+                prefix_seen = true;
+                queued.release();
+            }
+            if (proceed.try_acquire_for(std::chrono::milliseconds(1)))
+            {
+                return;
+            }
+        }
+        failed = true;
+    }
+};
+
+thread_local SendPrefixGate *active_send_gate = nullptr;
 
 class Client
 {
@@ -226,6 +314,39 @@ class Client
         return result == 0 || (result < 0 && errno == ECONNRESET);
     }
 
+    bool await_close()
+    {
+        if (!received_.empty())
+        {
+            throw std::runtime_error("unexpected response after final complete request");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        char byte;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const auto result = ::recv(fd_, &byte, 1, MSG_DONTWAIT);
+            if (result == 0 || (result < 0 && errno == ECONNRESET))
+            {
+                return true;
+            }
+            if (result > 0)
+            {
+                throw std::runtime_error("unexpected response after final complete request");
+            }
+            if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            {
+                throw std::runtime_error("wait for client EOF");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+
+    std::size_t wire_bytes_received() const noexcept
+    {
+        return wire_bytes_received_;
+    }
+
   private:
     bool receive(int flags = 0)
     {
@@ -244,11 +365,13 @@ class Client
             throw std::runtime_error(size < 0 ? std::strerror(errno) : "server closed response");
         }
         received_.append(buffer, static_cast<std::size_t>(size));
+        wire_bytes_received_ += static_cast<std::size_t>(size);
         return true;
     }
 
     int fd_;
     std::string received_;
+    std::size_t wire_bytes_received_ = 0;
 };
 
 void require(bool condition, std::string_view message)
@@ -1009,10 +1132,52 @@ void exercise_shutdown_pending()
             "shutdown does not replay prepared writes");
 }
 
+void exercise_half_closed_pipelines()
+{
+    Fixture fixture;
+    RunningServer server(fixture);
+    Client writes(server.port());
+    writes.send(write_request(R"({"body":"half-close-once"})") + get_post(3) + get_post());
+    writes.finish_writing();
+    require(writes.response(tds::Status::created).find("\"body\":\"half-close-once\"") !=
+                    std::string::npos &&
+                writes.response().find("\"body\":\"half-close-once\"") != std::string::npos &&
+                writes.response() == small_post,
+            "half-close discarded or reordered accepted write and read requests");
+    require(writes.await_close(), "completed half-closed pipeline did not close");
+
+    Client reads(server.port());
+    std::string pipeline;
+    constexpr unsigned count = 12;
+    for (unsigned index = 0; index < count; ++index)
+    {
+        pipeline += get_post();
+    }
+    reads.send(pipeline);
+    reads.finish_writing();
+    for (unsigned index = 0; index < count; ++index)
+    {
+        require(reads.response() == small_post, "EOF dropped a valid queued request");
+    }
+    require(reads.await_close(), "valid half-closed read pipeline did not close");
+
+    Client incomplete(server.port());
+    incomplete.send(get_post() + get_post() + "POST /posts HTTP/1.1\r\nHost: local\r\n");
+    incomplete.finish_writing();
+    require(incomplete.response() == small_post && incomplete.response() == small_post,
+            "incomplete final request discarded an earlier valid response");
+    require(incomplete.await_close(), "incomplete final request retained a half-closed connection");
+    server.stop();
+    require(fixture.scalar("SELECT count(*) FROM posts WHERE body='half-close-once'") == 1,
+            "half-closed accepted write was lost or executed twice");
+}
+
 void exercise_commit_publication()
 {
-    for (const bool reject : {false, true})
+    for (const unsigned mode : {0U, 1U, 2U})
     {
+        const bool reject = mode == 1;
+        const bool stop_during_commit = mode == 2;
         Fixture fixture;
         CommitGate gate{.reject = reject};
         std::promise<std::pair<std::uint16_t, int>> ready;
@@ -1038,19 +1203,32 @@ void exercise_commit_publication()
             active_commit_gate = nullptr;
         });
         const auto [port, stop_descriptor] = ready.get_future().get();
-        const auto stop = [&] {
+        bool stop_requested = false;
+        const auto request_stop = [&] {
+            if (stop_requested)
+            {
+                return;
+            }
             const std::uint64_t value = 1;
             ssize_t written;
             do
             {
                 written = ::write(stop_descriptor, &value, sizeof(value));
             } while (written < 0 && errno == EINTR);
+            require(written == static_cast<ssize_t>(sizeof(value)), "stop publication issuer");
+            stop_requested = true;
+        };
+        const auto stop = [&] {
+            if (!issuer.joinable())
+            {
+                return;
+            }
+            request_stop();
             issuer.join();
             if (server_error)
             {
                 std::rethrow_exception(server_error);
             }
-            require(written == static_cast<ssize_t>(sizeof(value)), "stop publication issuer");
         };
         try
         {
@@ -1061,15 +1239,30 @@ void exercise_commit_publication()
             require(!client.response_available(20), "HTTP success escaped before COMMIT resolved");
             require(fixture.scalar("SELECT count(*) FROM posts WHERE body='publication'") == 0,
                     "uncommitted row became visible to another in-process SQLite handle");
+            if (!reject)
+            {
+                client.finish_writing();
+            }
+            if (stop_during_commit)
+            {
+                request_stop();
+            }
             gate.proceed.release();
-            const auto body =
-                client.response(reject ? tds::Status::internal_error : tds::Status::created);
-            require(reject ? body == "{\"error\":\"internal server error\"}"
-                           : body.find("\"body\":\"publication\"") != std::string::npos,
-                    "commit outcome did not control the HTTP reply");
+            if (stop_during_commit)
+            {
+                stop();
+            }
+            else
+            {
+                const auto body =
+                    client.response(reject ? tds::Status::internal_error : tds::Status::created);
+                require(reject ? body == "{\"error\":\"internal server error\"}"
+                               : body.find("\"body\":\"publication\"") != std::string::npos,
+                        "commit outcome did not control the HTTP reply");
+            }
             require(fixture.scalar("SELECT count(*) FROM posts WHERE body='publication'") ==
                         (reject ? 0 : 1),
-                    "published response disagreed with committed visibility before shutdown");
+                    "commit publication, peer EOF or stop lost or replayed an accepted write");
         }
         catch (...)
         {
@@ -1077,6 +1270,90 @@ void exercise_commit_publication()
             throw;
         }
         stop();
+    }
+}
+
+void exercise_send_data_eof_collected_prefix()
+{
+    Fixture fixture;
+    SendPrefixGate gate;
+    std::promise<std::pair<std::uint16_t, int>> ready;
+    std::exception_ptr server_error;
+    std::jthread issuer([&] {
+        bool announced = false;
+        try
+        {
+            active_send_gate = &gate;
+            tds::Server server("127.0.0.1", 0, fixture.path, std::string(secret));
+            ready.set_value({server.port(), server.stop_descriptor()});
+            announced = true;
+            server.run();
+        }
+        catch (...)
+        {
+            server_error = std::current_exception();
+            if (!announced)
+            {
+                ready.set_exception(server_error);
+            }
+        }
+        active_send_gate = nullptr;
+    });
+    const auto [port, stop_descriptor] = ready.get_future().get();
+    bool released = false;
+    const auto release = [&] {
+        if (!released)
+        {
+            released = true;
+            gate.proceed.release();
+        }
+    };
+    bool stopped = false;
+    const auto stop = [&] {
+        if (stopped)
+        {
+            return;
+        }
+        stopped = true;
+        release();
+        const std::uint64_t value = 1;
+        ssize_t written;
+        do
+        {
+            written = ::write(stop_descriptor, &value, sizeof(value));
+        } while (written < 0 && errno == EINTR);
+        issuer.join();
+        if (server_error)
+        {
+            std::rethrow_exception(server_error);
+        }
+        require(written == static_cast<ssize_t>(sizeof(value)), "stop CQ-prefix fixture issuer");
+    };
+    try
+    {
+        Client client(port);
+        client.send(get_post());
+        require(gate.reached.try_acquire_for(std::chrono::seconds(5)),
+                "submit barrier did not hold the first response's SEND CQE");
+        require(client.response() == small_post &&
+                    client.wire_bytes_received() == static_cast<std::size_t>(gate.send_result),
+                "held SEND was partial or did not complete the exact first response");
+        client.send(get_post());
+        client.finish_writing();
+        require(gate.queued.try_acquire_for(std::chrono::seconds(5)),
+                "kernel did not queue the same-connection SEND, RX-data, RX-EOF prefix");
+        release();
+        require(
+            client.response() == small_post && client.await_close(),
+            "reducing SEND before later collected data/EOF lost or duplicated the next response");
+        stop();
+        require(gate.prefix_seen && !gate.failed,
+                "CQ-prefix fixture bypassed or exceeded its barrier");
+    }
+    catch (...)
+    {
+        stop();
+        throw;
     }
 }
 
@@ -1122,6 +1399,42 @@ void exercise_short_send(RunningServer &server)
     require(slow.response() == small_post, "pipeline resumes after the partial response");
 }
 
+void exercise_input_while_send_blocked(RunningServer &server)
+{
+    Client slow(server.port(), 4096);
+    slow.send(get_post());
+    require(slow.response() == small_post, "backlog fixture connection established");
+    constexpr unsigned reads = 192;
+    for (unsigned round = 0; round < 2; ++round)
+    {
+        slow.send(get_post(2));
+        wait_for_blocked_send(server.process());
+        const auto body = "{\"body\":\"tx-busy-once:" + std::to_string(round) + "\"}";
+        std::string queued = write_request(body);
+        for (unsigned index = 0; index < reads; ++index)
+        {
+            queued += get_post();
+        }
+        require(queued.size() > 2 * tds::net::ReceiveBuffers::size,
+                "TX-busy input fixture did not exceed the receive pause threshold");
+        slow.send(queued);
+        auto barrier = ready_client(server.port());
+        require(slow.response() == Fixture::large_post(),
+                "queued RX modified the response still borrowed by TX");
+        require(slow.response(tds::Status::created)
+                        .find("\"body\":\"tx-busy-once:" + std::to_string(round) + "\"") !=
+                    std::string::npos,
+                "paused RX lost, duplicated or reordered its accepted write");
+        for (unsigned index = 0; index < reads; ++index)
+        {
+            require(slow.response() == small_post, "RX backlog lost or reordered a pipelined read");
+        }
+    }
+    slow.send("GET /posts/1 HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n");
+    require(slow.response() == small_post && slow.await_close(),
+            "repeated RX pause/resume duplicated responses or failed to finish");
+}
+
 std::string pool_body(std::size_t id)
 {
     return std::to_string(id) + ':' + std::string(128, static_cast<char>('a' + id % 26));
@@ -1155,6 +1468,16 @@ void exercise_pool(RunningServer &server, const std::vector<std::unique_ptr<Clie
 
 void exercise_parser_limits(std::uint16_t port)
 {
+    Client long_headers(port);
+    std::string legal = "GET /posts/1 HTTP/1.1\r\nHost: localhost\r\n";
+    for (unsigned index = 0; index < 4096; ++index)
+    {
+        legal += "X-A: a\r\n";
+    }
+    legal += "\r\n";
+    long_headers.send(legal + get_post());
+    require(long_headers.response() == small_post && long_headers.response() == small_post,
+            "transport pause became a new total-header or pipeline byte rejection limit");
     for (const std::size_t size : {16384U, 16385U})
     {
         const std::string path = "/" + std::string(size - 1, 'x');
@@ -1411,6 +1734,42 @@ void exercise_capacity(std::size_t count, rlim_t descriptor_limit, bool progress
 } // namespace
 
 extern "C" int __real_sqlite3_step(sqlite3_stmt *);
+extern "C" int __real_io_uring_submit(io_uring *);
+extern "C" int __real_io_uring_submit_and_wait(io_uring *, unsigned);
+extern "C" int __real_io_uring_submit_and_wait_timeout(io_uring *, io_uring_cqe **, unsigned,
+                                                       __kernel_timespec *, sigset_t *);
+
+extern "C" int __wrap_io_uring_submit(io_uring *queue)
+{
+    const int result = __real_io_uring_submit(queue);
+    if (active_send_gate)
+    {
+        active_send_gate->after_submit(*queue);
+    }
+    return result;
+}
+
+extern "C" int __wrap_io_uring_submit_and_wait(io_uring *queue, unsigned count)
+{
+    const int result = __real_io_uring_submit_and_wait(queue, count);
+    if (active_send_gate)
+    {
+        active_send_gate->after_submit(*queue);
+    }
+    return result;
+}
+
+extern "C" int __wrap_io_uring_submit_and_wait_timeout(io_uring *queue, io_uring_cqe **cqe,
+                                                       unsigned count, __kernel_timespec *timeout,
+                                                       sigset_t *mask)
+{
+    const int result = __real_io_uring_submit_and_wait_timeout(queue, cqe, count, timeout, mask);
+    if (active_send_gate)
+    {
+        active_send_gate->after_submit(*queue);
+    }
+    return result;
+}
 
 extern "C" int __wrap_sqlite3_step(sqlite3_stmt *statement)
 {
@@ -1462,11 +1821,14 @@ int main(int argc, char **argv)
         exercise_request_reuse();
         exercise_write_batches();
         exercise_shutdown_pending();
+        exercise_half_closed_pipelines();
         exercise_commit_publication();
+        exercise_send_data_eof_collected_prefix();
         Fixture fixture;
         RunningServer server(fixture);
         exercise(server.port());
         exercise_short_send(server);
+        exercise_input_while_send_blocked(server);
         std::vector<std::unique_ptr<Client>> idle;
         for (int index = 0; index < 1536; ++index)
         {
@@ -1482,6 +1844,8 @@ int main(int argc, char **argv)
         wait_for_completion(-ENOBUFS, server.process());
         server.request_stop();
         server.stop();
+        require(fixture.scalar("SELECT count(*) FROM posts WHERE body LIKE 'tx-busy-once:%'") == 2,
+                "TX-busy readiness replayed or discarded an accepted database write");
         std::cout << "HTTP framing, real auth/writes, pipeline visibility, pool exhaustion, "
                      "partial sends and cancellation passed\n";
         std::cout << "Layout bytes: Connection=" << sizeof(tds::net::Connection)

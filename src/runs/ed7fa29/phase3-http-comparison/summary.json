@@ -1,0 +1,150 @@
+{
+  "measurement": {
+    "variants": [
+      {
+        "run": "phase3-control-350000",
+        "status": "passed",
+        "benchmark": {
+          "date": "2026-11-05",
+          "name": "phase3-control-350000",
+          "runtime": "C++ 0.1.0",
+          "load_generator": "docker_loopback",
+          "generator": "cpp",
+          "sqlite": "3.53.1",
+          "users": 350000,
+          "hold": "60s",
+          "ramp": "30s",
+          "requests": 3627519,
+          "rps": 27903.9163537,
+          "p95_ms": 10.5645351,
+          "p99_ms": 17.4668871,
+          "max_ms": 96.308971,
+          "error_rate": 0.0,
+          "cpu_us_per_request": 20.633106814878158,
+          "cpu_scope": "server_cgroup",
+          "server_peak_bytes": 1869955072,
+          "passed": true,
+          "client_sampled_peak_bytes": 1498963968
+        },
+        "hold": {
+          "count": 2223072,
+          "avg": 4.62674863551,
+          "p95": 11.3633234,
+          "p99": 18.53479753,
+          "max": 96.308971
+        },
+        "user_us_per_request": 5.679587067634932,
+        "kernel_us_per_request": 14.953519747243226,
+        "max_events": 0,
+        "oom_kills": 0,
+        "generator_rss_bytes": 161185792,
+        "provenance": {
+          "source": null,
+          "binary": {
+            "server": {
+              "image_id": "sha256:c37c27f42955943f6bffe4efd9a69ea5f216286449edd46191782f1d8215ccd7",
+              "sha256": "5c6c8150ce9e38c9c57d7aff4071d6e0fa0a02ea3a86255e2d63277849db828b"
+            },
+            "generator": {
+              "image_id": "sha256:12de8c99db5ae21228a5170e97becbc16c119d50798cfee0ac87d6b12254094c",
+              "sha256": "f2634e9500b5017ee4c3ca77329ea8a98c54544b92e972ba9ba637fba69a4a1e"
+            }
+          }
+        }
+      },
+      {
+        "run": "phase3-pipeline-350000",
+        "status": "passed",
+        "benchmark": {
+          "date": "2026-11-05",
+          "name": "phase3-pipeline-350000",
+          "runtime": "C++ 0.1.0",
+          "load_generator": "docker_loopback",
+          "generator": "cpp",
+          "sqlite": "3.53.1",
+          "users": 350000,
+          "hold": "60s",
+          "ramp": "30s",
+          "requests": 3627402,
+          "rps": 27903.0139612,
+          "p95_ms": 10.8041798,
+          "p99_ms": 22.15454013,
+          "max_ms": 684.86874,
+          "error_rate": 0.0,
+          "cpu_us_per_request": 19.388114689245914,
+          "cpu_scope": "server_cgroup",
+          "server_peak_bytes": 1946218496,
+          "passed": true,
+          "client_sampled_peak_bytes": 1499357184
+        },
+        "hold": {
+          "count": 2222405,
+          "avg": 7.84662871233,
+          "p95": 12.704341,
+          "p99": 74.6197122,
+          "max": 684.86874
+        },
+        "user_us_per_request": 5.481095836634594,
+        "kernel_us_per_request": 13.907018852611317,
+        "max_events": 0,
+        "oom_kills": 0,
+        "generator_rss_bytes": 161542144,
+        "provenance": {
+          "source": {
+            "base_commit": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+            "patch_sha256": "533c79bccaf3513a77bd1e460f4d17d5fa12c8dbc8564cfb842fe3af8b593763",
+            "source_sha256": "af1cb086d4e8de6bcbf559987a9375862f3f3d7ac1e05daf6a93480a179064ab",
+            "patch": "source.patch"
+          },
+          "binary": {
+            "server": {
+              "image_id": "sha256:0cfa400cf9fd63458bd57b7b1062b4b88f9a8f5dcd7bceb7f0a0aa09d2db24fc",
+              "sha256": "2e73c86b91de4b32605b3734a4b15c0c2c8997c799558cca4f9a19ac533d180a"
+            },
+            "generator": {
+              "image_id": "sha256:12de8c99db5ae21228a5170e97becbc16c119d50798cfee0ac87d6b12254094c",
+              "sha256": "f2634e9500b5017ee4c3ca77329ea8a98c54544b92e972ba9ba637fba69a4a1e"
+            }
+          }
+        }
+      }
+    ],
+    "delta": {
+      "cpu_percent": -6.03395376567577,
+      "kernel_cpu_percent": -6.9983583284787265,
+      "peak_memory_mib": 72.73046875,
+      "hold_p99_ratio": 4.025925402164347
+    },
+    "decision": "mixed, pipeline performance gate remains open",
+    "limitations": [
+      "one A/B pair",
+      "WSL 6.18.54.1, not target Linux 6.8",
+      "no per-request stall timing in release/off"
+    ]
+  },
+  "schema_version": 1,
+  "anchor": "ed7fa29440b7a35ec33a98585d665d29c63df025",
+  "label": "phase3-http-comparison",
+  "kind": "comparison",
+  "started_at": "2026-11-05T01:07:41.682266+00:00",
+  "status": "passed",
+  "finished_at": "2026-11-05T01:07:41.684672+00:00",
+  "exit_code": 0,
+  "error": null,
+  "secondary_errors": [],
+  "workload": {
+    "vus": 350000,
+    "ramp": "30s",
+    "hold": "60s",
+    "seed": 20261104
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": null,
+    "binary": null
+  }
+}

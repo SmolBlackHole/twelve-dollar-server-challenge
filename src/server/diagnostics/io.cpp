@@ -222,10 +222,14 @@ RingSnapshot IoTelemetry::snapshot_ring(net::Ring &owner, std::size_t index,
     snapshot.deferred_receive_queue_depth = owner.deferred_receives.size();
     snapshot.pooled_exchanges = owner.exchange_pool_.size();
 #if TDS_TELEMETRY_LEVEL == 2
-    // Retries can rejoin the FIFO, so the front need not have the oldest first ENOBUFS
-    const auto *front = owner.deferred_receives.empty() ? nullptr : owner.deferred_receives.front();
+    // This remains the FIFO-head age, not a scan for the oldest ENOBUFS
+    const auto *front = owner.deferred_receives.empty()
+                            ? nullptr
+                            : owner.connections.find(owner.deferred_receives.front());
     snapshot.deferred_receive_front_enobufs_age_ns =
-        front ? now - front->receive_enobufs_since_ns : 0;
+        front && front->receive_deferred && front->receive_enobufs_since_ns
+            ? now - front->receive_enobufs_since_ns
+            : 0;
     snapshot.timings = statistics.interval;
 #endif
 

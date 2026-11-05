@@ -10,7 +10,7 @@ namespace tds::net
 class ConnectionStore;
 class Reactor;
 class Ring;
-struct Completion;
+class Completion;
 struct Connection;
 } // namespace tds::net
 

@@ -26,7 +26,6 @@ using tds::net::Completion;
 using tds::net::CompletionKind;
 using tds::net::Connection;
 using tds::net::Event;
-using tds::net::Operation;
 using tds::net::Reactor;
 using tds::net::ReceiveBufferLease;
 using tds::net::ReceiveBuffers;
@@ -124,25 +123,6 @@ void wait_for_cqes(Ring &owner, unsigned count, Clock::time_point deadline)
     }
 }
 
-unsigned exhausted_cqes(Ring &owner)
-{
-    unsigned count = 0;
-    unsigned seen = 0;
-    unsigned head = 0;
-    io_uring_cqe *cqe = nullptr;
-    io_uring_for_each_cqe(&owner.queue, head, cqe)
-    {
-        if (seen++ == 256)
-        {
-            break;
-        }
-        const auto *operation = static_cast<Operation *>(io_uring_cqe_get_data(cqe));
-        count += operation && operation->event == Event::receive && cqe->res == -ENOBUFS;
-    }
-
-    return count;
-}
-
 struct Sample
 {
     std::uint64_t cpu = 0;
@@ -152,16 +132,16 @@ struct Sample
 };
 
 Sample recover(Reactor &reactor, const std::vector<std::unique_ptr<Client>> &clients,
-               const std::vector<Connection *> &connections, bool initial)
+               const std::vector<Connection *> &connections)
 {
     auto &owner = *reactor.rings().front();
-    // Start each burst with the fresh-ring credit state after returning every previous lease
+    // Persistent originals survive bursts; only a consumed successful terminal needs resuming
     owner.receive_buffers->take_retry_credits(ReceiveBuffers::count);
-    if (!initial)
+    for (auto *connection : connections)
     {
-        for (auto *connection : connections)
+        if (connection->rx_paused && !connection->rx.busy())
         {
-            reactor.receive(*connection);
+            reactor.resume_receive(*connection);
         }
     }
     owner.submit();
@@ -170,62 +150,114 @@ Sample recover(Reactor &reactor, const std::vector<std::unique_ptr<Client>> &cli
         client->send();
     }
     const auto deadline = Clock::now() + 5s;
-    wait_for_cqes(owner, clients_count, deadline);
-    require(io_uring_cq_ready(&owner.queue) == clients_count,
-            "burst did not produce exactly one original CQE per client");
 
     std::vector<ReceiveBufferLease> held;
     held.reserve(ReceiveBuffers::count);
     std::vector<bool> received(owner.connections.size());
+    std::vector<bool> exhausted(owner.connections.size());
     unsigned completed = 0;
+    unsigned terminals = 0;
+    unsigned failures = 0;
+    bool successful_terminal = false;
     const auto retain = [&](Completion &completion) {
-        if (completion.kind == CompletionKind::control)
+        require(completion.operation.event() == Event::receive && completion.connection,
+                "recovery unexpectedly completed non-receive work");
+        const auto slot = completion.connection->slot.value;
+        const bool more = (completion.flags & IORING_CQE_F_MORE) != 0;
+        terminals += !more;
+        if (completion.result == -ENOBUFS)
         {
+            require(!more && completion.kind == CompletionKind::control,
+                    "buffer exhaustion did not terminate its original receive");
+            exhausted[slot] = true;
+            ++failures;
             return;
         }
         require(completion.kind == CompletionKind::received && completion.result == 1 &&
                     completion.buffer.bytes().size() == 1 &&
                     completion.buffer.bytes().front() == 'x',
                 "recovery changed the payload or completion kind");
-        const auto slot = completion.connection->slot.value;
+        require(completion.connection->rx.active() == more,
+                "receive data lost its persistent or terminal lifetime");
+        successful_terminal |= !more;
         require(!received[slot], "recovery duplicated a client payload");
         received[slot] = true;
         ++completed;
         held.push_back(std::move(completion.buffer));
     };
 
-    unsigned failures = 0;
-    for (unsigned turn = 0; turn < clients_count / 256; ++turn)
+    const auto pressure_ready = [&] {
+        if (completed != ReceiveBuffers::count)
+        {
+            return false;
+        }
+        for (const auto *connection : connections)
+        {
+            const auto slot = connection->slot.value;
+            if (!received[slot] && !exhausted[slot])
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    // Data CQEs with MORE and original terminal CQEs consume independent CQ entries
+    while (!pressure_ready() || io_uring_cq_ready(&owner.queue))
     {
+        require(Clock::now() < deadline, "initial selected-buffer exhaustion timed out");
         reactor.begin_turn();
-        failures += exhausted_cqes(owner);
         drain_turn(reactor, retain);
     }
     require(completed == ReceiveBuffers::count && held.size() == ReceiveBuffers::count &&
-                failures == recovered_count,
+                failures >= recovered_count && !owner.accept_refill_needed,
             "burst did not force the expected selected-buffer exhaustion");
 
     Sample sample;
-    sample.retries = recovered_count - static_cast<unsigned>(owner.deferred_receives.size());
+    const auto first_sqe = owner.queue.sq.sqe_tail;
+    const auto first_pending = owner.pending;
+    const auto first_terminal = terminals;
+    const auto first_failure = failures;
     const auto started = Clock::now();
     const auto cpu_started = cpu_ns();
     held.clear();
+    if (successful_terminal)
+    {
+        for (auto *connection : connections)
+        {
+            if (received[connection->slot.value] && connection->rx_paused && !connection->rx.busy())
+            {
+                reactor.resume_receive(*connection);
+            }
+        }
+    }
     while (completed != clients_count)
     {
         require(Clock::now() < deadline, "ENOBUFS recovery timed out");
         // Only the real production wait path progresses the recovery phase
         reactor.begin_turn();
-        sample.failures += exhausted_cqes(owner);
         drain_turn(reactor, retain);
-        sample.retries += io_uring_sq_ready(&owner.queue);
     }
     sample.cpu = cpu_ns() - cpu_started;
     sample.wall = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
-    require(owner.deferred_receives.empty() && held.size() == recovered_count,
-            "recovery lost a deferred receive or retained the wrong leases");
-    require(sample.retries == recovered_count + sample.failures,
-            "retry submission and terminal CQE counts disagree");
+    // SQE tail counts actual preparations, including a retry still queued at the measurement end
+    sample.retries = owner.queue.sq.sqe_tail - first_sqe;
+    sample.failures = failures - first_failure;
+    const auto accounted = static_cast<std::int64_t>(owner.pending) - first_pending +
+                           static_cast<std::int64_t>(terminals - first_terminal);
+    require(accounted >= 0 && static_cast<std::uint64_t>(accounted) == sample.retries,
+            "retry preparations disagree with active-original and terminal accounting");
+    require(held.size() == recovered_count &&
+                static_cast<unsigned>(std::count(received.begin(), received.end(), true)) ==
+                    clients_count,
+            "recovery lost or duplicated useful client input");
+    for (const auto *connection : connections)
+    {
+        require(
+            !connection->closing() && !connection->rx_eof &&
+                (connection->rx.active() || connection->receive_deferred || connection->rx_paused),
+            "recovery lost a persistent receive or its eligible resume state");
+    }
 
     return sample;
 }
@@ -234,7 +266,7 @@ void shutdown(Reactor &reactor)
 {
     reactor.request_stop();
     const auto deadline = Clock::now() + 5s;
-    while (reactor.pending_count())
+    while (reactor.has_work())
     {
         require(Clock::now() < deadline, "shutdown timed out");
         reactor.begin_turn();
@@ -302,7 +334,7 @@ int main(int argc, char **argv)
             constexpr unsigned warmup = 8;
             for (unsigned cycle = 0; cycle < warmup + cycles; ++cycle)
             {
-                const auto sample = recover(reactor, clients, connections, cycle == 0);
+                const auto sample = recover(reactor, clients, connections);
                 if (cycle >= warmup)
                 {
                     samples.push_back(sample);

@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <system_error>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -23,6 +24,7 @@ namespace
 using tds::bench::ReceiveBackend;
 using tds::bench::ReceiveCompletion;
 using tds::bench::ReceiveEvent;
+using tds::bench::ReceiveHandoff;
 using tds::bench::ReceiveMode;
 using tds::bench::ReceiveWait;
 using tds::net::Descriptor;
@@ -62,9 +64,29 @@ class Loopback
                 ::setsockopt(client.get(), IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) ==
                     0,
             "configure loopback client");
-        require(::connect(client.get(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) ==
-                    0,
-                "connect loopback client");
+        if (::connect(client.get(), reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0)
+        {
+            if (errno != EINTR)
+            {
+                throw std::system_error(errno, std::generic_category(), "connect loopback client");
+            }
+            // An interrupted connect may still finish, do not start a second connection
+            pollfd ready{client.get(), POLLOUT, 0};
+            int result;
+            do
+            {
+                result = ::poll(&ready, 1, 5000);
+            } while (result < 0 && errno == EINTR);
+            require(result > 0, "interrupted loopback connection timed out");
+            int error = 0;
+            socklen_t error_length = sizeof(error);
+            require(::getsockopt(client.get(), SOL_SOCKET, SO_ERROR, &error, &error_length) == 0,
+                    "read interrupted loopback connection error");
+            if (error)
+            {
+                throw std::system_error(error, std::generic_category(), "connect loopback client");
+            }
+        }
         server = std::make_unique<Descriptor>(
             ::accept4(listener.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC));
     }
@@ -1144,6 +1166,266 @@ void shared_pool_exhaustion(ReceiveMode mode)
             "shared-pool leases did not return exactly once while both sockets were quiet");
 }
 
+template <class Consume>
+void handoff_turn(ReceiveBackend &backend, ReceiveHandoff &handoff, Consume &&consume)
+{
+    wait_ready(backend);
+    backend.begin_turn();
+    const auto collected = handoff.collect(backend);
+    backend.finish_turn();
+    require(collected > 0 && handoff.size() == collected, "handoff collection count");
+    ReceiveCompletion completion;
+    unsigned consumed = 0;
+    while (handoff.next(completion))
+    {
+        consume(completion);
+        ++consumed;
+    }
+    require(consumed == collected && handoff.size() == 0 &&
+                completion.event == ReceiveEvent::receive && completion.slot == 0 &&
+                completion.result == 0 && completion.flags == 0 &&
+                completion.buffer.bytes().empty(),
+            "empty handoff retained a record or output lease");
+}
+
+void handoff_fragmented_stream(ReceiveMode mode)
+{
+    Loopback sockets;
+    ReceiveBackend backend(sockets.server->get(), mode);
+    ReceiveHandoff handoff;
+    std::string expected;
+    std::string received;
+    unsigned leases = 0;
+    for (const auto &fragment :
+         {std::string("first"), std::string(9001, 'x'), std::string("\0last\xff", 6)})
+    {
+        expected += fragment;
+        transfer(sockets.client.get(), fragment);
+        while (received.size() < expected.size())
+        {
+            if (!backend.receiving())
+            {
+                backend.receive();
+            }
+            handoff_turn(backend, handoff, [&](ReceiveCompletion &completion) {
+                require(completion.event == ReceiveEvent::receive && completion.slot == 0 &&
+                            completion.result > 0 && selected(completion) &&
+                            more(completion) == (mode == ReceiveMode::multishot),
+                        "handoff changed fragmented receive identity or flags");
+                append(received, completion);
+                ++leases;
+            });
+        }
+        require(received == expected, "handoff lost, duplicated or reordered fragment bytes");
+    }
+    require(::shutdown(sockets.client.get(), SHUT_WR) == 0, "half-close handoff fragments");
+    if (!backend.receiving())
+    {
+        backend.receive();
+    }
+    unsigned terminals = 0;
+    while (backend.pending())
+    {
+        handoff_turn(backend, handoff, [&](ReceiveCompletion &completion) {
+            require(completion.event == ReceiveEvent::receive && completion.slot == 0 &&
+                        completion.result == 0 && !more(completion),
+                    "handoff changed fragmented EOF");
+            leases += selected(completion);
+            ++terminals;
+        });
+    }
+    auto &buffers = *backend.owner().receive_buffers;
+    require(terminals == 1 && buffers.take_retry_credits(ReceiveBuffers::count) == leases &&
+                buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "handoff fragment leases did not return exactly once");
+}
+
+void handoff_completion_fields()
+{
+    std::array<Loopback, 2> sockets;
+    const std::array descriptors{sockets[0].server->get(), sockets[1].server->get()};
+    ReceiveBackend backend(descriptors, ReceiveMode::multishot, ReceiveWait::immediate);
+    ReceiveHandoff handoff;
+    backend.receive(0);
+    backend.receive(1);
+    const std::array payloads{std::string("0"), std::string("\0", 1)};
+    // Gate both writes so their CQ order and separate owning leases are known
+    transfer(sockets[1].client.get(), payloads[1]);
+    wait_ready(backend, 1);
+    transfer(sockets[0].client.get(), payloads[0]);
+    wait_ready(backend, 2);
+    backend.cancel_receive(0);
+    require(::shutdown(sockets[1].client.get(), SHUT_WR) == 0, "half-close handoff slot one");
+    constexpr unsigned count = 5; // Two data CQEs, EOF, original cancel terminal and cancel ack
+    wait_ready(backend, count);
+    backend.begin_turn();
+
+    struct Fields
+    {
+        ReceiveEvent event;
+        unsigned slot;
+        int result;
+        unsigned flags;
+    };
+
+    std::array<Fields, count> expected;
+    const auto &cq = backend.owner().queue.cq;
+    const auto head = *cq.khead;
+    require(io_uring_cq_ready(&backend.owner().queue) == count,
+            "handoff field fixture produced an unexpected CQE");
+    for (unsigned index = 0; index < count; ++index)
+    {
+        const auto &entry = cq.cqes[(head + index) & cq.ring_mask];
+        const auto identity = io_uring_cqe_get_data64(&entry);
+        expected[index] = {static_cast<ReceiveEvent>(identity & 3U),
+                           static_cast<unsigned>(identity >> 2), entry.res, entry.flags};
+    }
+    require(handoff.collect(backend) == count && handoff.size() == count && backend.pending() == 0,
+            "handoff did not collect both independent operation lifetimes");
+    backend.finish_turn();
+    auto &buffers = *backend.owner().receive_buffers;
+    require(buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "handoff returned selected buffers before consumption");
+    std::array<std::string, 2> received;
+    unsigned leases = 0;
+    bool cancelled = false;
+    bool acknowledged = false;
+    bool eof = false;
+    ReceiveCompletion completion;
+    for (unsigned index = 0; index < count; ++index)
+    {
+        const auto &fields = expected[index];
+        require(handoff.next(completion) && completion.event == fields.event &&
+                    completion.slot == fields.slot && completion.result == fields.result &&
+                    completion.flags == fields.flags && handoff.size() == count - index - 1,
+                "handoff changed CQ FIFO order, signed result, identity or complete flags");
+        leases += selected(completion);
+        if (completion.result > 0)
+        {
+            require(completion.event == ReceiveEvent::receive && more(completion) &&
+                        selected(completion) && index < 2 && completion.slot == 1 - index,
+                    "handoff data crossed independent socket identities");
+            append(received[completion.slot], completion);
+        }
+        else if (completion.event == ReceiveEvent::cancel)
+        {
+            require(completion.slot == 0 && completion.result == 0 && !more(completion) &&
+                        !selected(completion) && !acknowledged,
+                    "handoff changed cancellation acknowledgement");
+            acknowledged = true;
+        }
+        else if (completion.slot == 0)
+        {
+            require(completion.event == ReceiveEvent::receive && completion.result == -ECANCELED &&
+                        !more(completion) && !cancelled,
+                    "handoff changed negative original receive terminal");
+            cancelled = true;
+        }
+        else
+        {
+            require(completion.event == ReceiveEvent::receive && completion.slot == 1 &&
+                        completion.result == 0 && !more(completion) && !eof,
+                    "handoff changed independent EOF terminal");
+            eof = true;
+        }
+    }
+    completion = {};
+    completion.event = ReceiveEvent::send;
+    completion.slot = 17;
+    completion.result = -EIO;
+    completion.flags = ~0U;
+    require(!handoff.next(completion) && completion.event == ReceiveEvent::receive &&
+                completion.slot == 0 && completion.result == 0 && completion.flags == 0 &&
+                completion.buffer.bytes().empty() && received == payloads && cancelled &&
+                acknowledged && eof &&
+                buffers.take_retry_credits(ReceiveBuffers::count) == leases &&
+                buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "handoff empty output or exact lease return contract");
+}
+
+void handoff_capacity_and_wrap()
+{
+    Loopback sockets;
+    ReceiveBackend backend(sockets.server->get(), ReceiveMode::multishot);
+    backend.receive();
+    auto &buffers = *backend.owner().receive_buffers;
+    unsigned produced = 0;
+    unsigned consumed = 0;
+    const auto byte = [](unsigned index) {
+        return static_cast<char>('!' + index % 90);
+    };
+    const auto queue = [&](unsigned count) {
+        for (unsigned ready = 1; ready <= count; ++ready)
+        {
+            const char value = byte(produced++);
+            transfer(sockets.client.get(), std::string_view(&value, 1));
+            wait_ready(backend, ready);
+            require(io_uring_cq_ready(&backend.owner().queue) == ready,
+                    "handoff capacity fixture coalesced gated writes");
+        }
+    };
+    {
+        ReceiveHandoff handoff;
+        const auto consume = [&](unsigned count) {
+            ReceiveCompletion completion;
+            for (unsigned index = 0; index < count; ++index)
+            {
+                require(handoff.next(completion) && completion.event == ReceiveEvent::receive &&
+                            completion.slot == 0 && completion.result == 1 &&
+                            selected(completion) && more(completion) &&
+                            completion.buffer.bytes().size() == 1 &&
+                            completion.buffer.bytes().front() == byte(consumed++),
+                        "handoff wrap lost a lease, fields or FIFO byte order");
+            }
+        };
+        queue(ReceiveHandoff::capacity + 1);
+        backend.begin_turn();
+        require(handoff.collect(backend) == ReceiveHandoff::capacity &&
+                    handoff.size() == ReceiveHandoff::capacity,
+                "handoff did not fill its fixed capacity");
+        backend.finish_turn();
+        backend.begin_turn();
+        require(handoff.collect(backend) == 0 && io_uring_cq_ready(&backend.owner().queue) == 1 &&
+                    buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+                "full handoff consumed the next kernel CQE or released a held lease");
+        consume(17);
+        require(buffers.take_retry_credits(ReceiveBuffers::count) == 17,
+                "partial handoff drain did not return exactly its consumed leases");
+        require(handoff.collect(backend) == 1 && handoff.size() == ReceiveHandoff::capacity - 16,
+                "full handoff fetched or lost the pending CQE before same-turn refill");
+        backend.finish_turn();
+        consume(200);
+        require(buffers.take_retry_credits(ReceiveBuffers::count) == 200,
+                "handoff refill returned an existing queued lease");
+        queue(200);
+        backend.begin_turn();
+        require(handoff.collect(backend) == 200 && handoff.size() == ReceiveHandoff::capacity - 16,
+                "handoff wrap overwrote existing FIFO records");
+        backend.finish_turn();
+        consume(100);
+        require(buffers.take_retry_credits(ReceiveBuffers::count) == 100 &&
+                    buffers.take_retry_credits(ReceiveBuffers::count) == 0 &&
+                    handoff.size() == produced - consumed,
+                "handoff wrap lease count changed");
+        // Destroy queued leases while their backend pool is still alive
+    }
+    require(buffers.take_retry_credits(ReceiveBuffers::count) == produced - consumed &&
+                buffers.take_retry_credits(ReceiveBuffers::count) == 0,
+            "handoff destruction did not return each remaining lease exactly once");
+    require(::shutdown(sockets.client.get(), SHUT_WR) == 0, "half-close handoff capacity fixture");
+    unsigned terminals = 0;
+    while (backend.pending())
+    {
+        turn(backend, [&](ReceiveCompletion &completion) {
+            require(completion.event == ReceiveEvent::receive && completion.result == 0 &&
+                        !more(completion),
+                    "handoff capacity fixture lost original receive lifetime");
+            ++terminals;
+        });
+    }
+    require(terminals == 1, "handoff capacity fixture duplicated receive terminal");
+}
+
 } // namespace
 
 int main()
@@ -1157,6 +1439,10 @@ int main()
         cancellation_drains_both_completions();
         cancellation_after_queued_eof();
         exhaustion_and_bounded_rearm();
+        handoff_fragmented_stream(ReceiveMode::one_shot);
+        handoff_fragmented_stream(ReceiveMode::multishot);
+        handoff_completion_fields();
+        handoff_capacity_and_wrap();
         for (const auto mode : {ReceiveMode::one_shot, ReceiveMode::multishot})
         {
             isolated_socket_streams(mode);

@@ -126,6 +126,8 @@
 | C++ 0.1.0 ([POLL_FIRST, late ramp](src/runs/701bae9/receive-pollfirst-350000/summary.json)) | 350,000 | 60 s | 3,551,100 | 27,315.98 | 19.677 ms | 72.775 ms | 1,332.56 ms | 0% | 23.06 us | 954.14 MiB |
 | C++ 0.1.0 ([Receive hint](src/runs/701bae9/receive-hint-350000/summary.json)) | 350,000 | 60 s | 3,619,164 | 27,839.62 | 21.647 ms | 596.224 ms | 5,252.42 ms | 0% | 23.74 us | 981.70 MiB |
 | C++ 0.1.0 ([POLL_FIRST, repeat](src/runs/701bae9/receive-pollfirst-350000-repeat/summary.json)) | 350,000 | 60 s | 3,627,168 | 27,901.24 | 16.765 ms | 28.216 ms | 169.15 ms | 0% | 23.41 us | 948.54 MiB |
+| C++ 0.1.0 ([pipeline control, WSL 6.18](src/runs/ed7fa29/phase3-control-350000/summary.json)) | 350,000 | 60 s | 3,627,519 | 27,903.92 | 10.565 ms | 17.467 ms | 96.31 ms | 0% | 20.63 us | 1783.33 MiB |
+| C++ 0.1.0 ([bounded pipeline, WSL 6.18](src/runs/ed7fa29/phase3-pipeline-350000/summary.json)) | 350,000 | 60 s | 3,627,402 | 27,903.01 | 10.804 ms | 22.155 ms | 684.87 ms | 0% | 19.39 us | 1856.06 MiB |
 
 Release `5166f4b`, 450k/5m, WSL 6.18, telemetry/perf/client diagnostics off: 16,081,329 requests, 43,462.96 requests/s, 19.93 us/request, hold p95/p99 14.18/47.41 ms, zero errors. Server peak 2087.41 MiB, no OOM kills. All 450k received responses; activation at 30.130s missed the 30.100s deadline, so the run failed despite passing HTTP thresholds. Generator peak RSS 542.43 MiB. [Data](src/runs/5166f4b/release-450000-5m/summary.json).
 
@@ -345,6 +347,10 @@ WAL cache eviction, Mini 50k, two reversed pairs, 20-second holds: mean file cac
 Docker HTTP comparison remains inconclusive: one run missed target concurrency before the first checkpoint; a diagnostic repeat passed. Both showed substantial I/O wait.
 
 ## Native CPU sampling
+
+One-shot CQ/RX handoff, 16/128/512 sockets, four reversed pairs, CQ 128/8 ms and 4-MiB pool fixed: median paired CPU change -0.11% to +2.65%, 12,296 bytes of queue storage, equal bytes/replies; contracts passed. 128-socket median raw p99 rose 10.16 to 31.22 ms. A separate fresh-cgroup check reproduced roughly 30-ms tails in both paths when throttled; most unthrottled samples were near 1 ms. No HTTP performance claim. [Screen](src/runs/ed7fa29/receive-handoff-native/summary.json), [quota check](src/runs/ed7fa29/receive-handoff-latency-check/summary.json).
+
+450k/60s, WSL 6.18, profile telemetry + perf all: 4,651,914 requests, zero errors, 21.41 us/request, hold p95/p99 99.69/1288.29 ms, peak RAM 2085.99 MiB. Ramp passed; p99 failed. 128,190 memory-limit events, no OOM kills. 55,577 samples, no loss: network 46.99%, database 19.11%, io_uring 10.69%, filesystem 8.09%. Internal telemetry export missing after server exit 137. [Data](src/runs/ed7fa29/diagnostic-450000-60s/summary.json).
 
 Telemetry cleanup, 350k, 30s ramp / 60s capture, perf all + profile telemetry + client diagnostics: 3,625,395 requests, 0 errors, p99 7.37 ms (hold 10.73 ms), 24.34 us/request, 992.11 MiB server peak. Generator process peak RSS 155.74 MiB; sampled cgroup peak 1,405.16 MiB. Failed the generator ramp deadline: 30.160s versus 30.100s. [Data](src/runs/4ec3f7a/telemetry-cleanup-350000/summary.json).
 
