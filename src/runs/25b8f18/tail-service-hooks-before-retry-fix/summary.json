@@ -1,0 +1,30 @@
+{
+  "measurement": {},
+  "schema_version": 1,
+  "anchor": "25b8f1883362eacc4a493c530886dac4a34138aa",
+  "label": "tail-service-hooks-before-retry-fix",
+  "kind": "probe",
+  "started_at": "2026-11-05T12:50:37.649471+00:00",
+  "status": "failed",
+  "finished_at": "2026-11-05T12:51:24.557471+00:00",
+  "exit_code": 1,
+  "error": "RuntimeError('focused-tests failed, exit 8')",
+  "secondary_errors": [],
+  "workload": {
+    "kind": "transport_contracts"
+  },
+  "instruments": {
+    "server_telemetry": "profile",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "25b8f1883362eacc4a493c530886dac4a34138aa",
+      "patch_sha256": "b59b4172cfd64a28ae38f33eff513d254151ba8973f9ad271cbcb6185676db2b",
+      "source_sha256": "d1c325c445bc131e1af5c292e5ea6c834e33d728c871051e0875cf9ff9808d2b",
+      "patch": "source.patch"
+    },
+    "binary": null
+  }
+}

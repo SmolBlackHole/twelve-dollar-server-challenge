@@ -11,6 +11,7 @@ class ConnectionStore;
 class Reactor;
 class Ring;
 class Completion;
+class ReceiveBufferLease;
 struct Connection;
 } // namespace tds::net
 
@@ -109,10 +110,12 @@ class IoTelemetry
     {
       public:
 #if TDS_TELEMETRY_LEVEL == 2
-        Receive() noexcept;
+        Receive(const net::Connection &connection, const net::ReceiveBufferLease &buffer) noexcept;
         void attach(net::Connection &connection) const noexcept;
 #else
-        Receive() noexcept = default;
+        Receive(const net::Connection &, const net::ReceiveBufferLease &) noexcept
+        {
+        }
 
         void attach(net::Connection &) const noexcept
         {
@@ -140,9 +143,10 @@ class IoTelemetry
         return WriteBatch(*this, count);
     }
 
-    Receive receive() noexcept
+    Receive receive(const net::Connection &connection,
+                    const net::ReceiveBufferLease &buffer) noexcept
     {
-        return Receive{};
+        return Receive(connection, buffer);
     }
 
 #if TDS_TELEMETRY_LEVEL == 2
@@ -187,7 +191,8 @@ class IoTelemetry
     static void drain_started(net::Ring &owner) noexcept;
     static void drain_finished(net::Ring &owner, unsigned drained) noexcept;
     static void receive_prepared(net::Connection &connection) noexcept;
-    static void receive_completed(net::Connection &connection, int result) noexcept;
+    static void receive_completed(net::Connection &connection, int result,
+                                  const net::ReceiveBufferLease &buffer) noexcept;
     static void store_created(net::ConnectionStore &owner) noexcept;
     static void store_retired(net::ConnectionStore &owner) noexcept;
     static void exchange_allocated(net::Ring &owner) noexcept;
@@ -205,7 +210,7 @@ class IoTelemetry
     {
     }
 
-    static void receive_completed(net::Connection &, int) noexcept
+    static void receive_completed(net::Connection &, int, const net::ReceiveBufferLease &) noexcept
     {
     }
 

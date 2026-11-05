@@ -2,7 +2,7 @@
 
 ## Transport pipeline
 
-Status: approved. Active phase: 3, bounded pipeline integration. Later phases stay deferred until their own gates pass.
+Status: RX/TX implementation is functional and tested (phases 1-3). Phase 3 remains open only for the original tail spike's attribution. Phases 4 and 5, storage/layout and scheduling, have not started.
 
 ### Goal and baseline
 
@@ -114,7 +114,7 @@ Likely files: `src/benchmarks/receive.cpp`, `src/benchmarks/receive_backend.hpp`
 - [x] Compare CPU, kernel CPU, producer CPU, raw RTT and buffer return/rearm behavior at 16/128/512 connections with short fixed-work runs.
 - [x] Treat a repeatable CPU regression outside the controls' own spread as a failed cost screen. Do not compensate by enlarging batches or buffers silently; revisit the number of handoffs first.
 
-The [four-pair screen](src/runs/ed7fa29/receive-handoff-native/summary.json) passes the declared CPU-cost gate: median paired change -0.11% to +2.65%, fixed storage 12,296 bytes, equal bytes/replies, contracts passed. Higher 128-socket RTT is not isolated to the handoff: a [fresh-cgroup check](src/runs/ed7fa29/receive-handoff-latency-check/summary.json) reproduces roughly 30-ms tails in both paths with throttling, versus roughly 1 ms in most unthrottled samples. Production remains unchanged; the probe rejects the staged multishot consumer until its independent state model exists.
+The [four-pair screen](src/runs/ed7fa29/receive-handoff-native/summary.json) passes the declared CPU-cost gate: median paired change -0.11% to +2.65%, fixed storage 12,296 bytes, equal bytes/replies, contracts passed. Higher 128-socket RTT is not isolated to the handoff: a [fresh-cgroup check](src/runs/ed7fa29/receive-handoff-latency-check/summary.json) reproduces roughly 30-ms tails in both paths with throttling, versus roughly 1 ms in most unthrottled samples.
 
 Gate: lossless ownership and a justified handoff cost. A native pass permits the ownership work, not an HTTP performance claim. This is a probe experiment, not a temporary second production backend.
 
@@ -129,7 +129,7 @@ Likely files: `src/server/net/connection.hpp`, `connections.*`, `reactor.*`, `ri
 - [x] Exercise stale slot reuse, late CQEs and generation exhaustion. Confirm selected buffers return exactly once even when the connection handle is stale.
 - [x] Verify fatal teardown with live operations and held leases before relying on destructors.
 
-Production state model passed [all 20 release tests](src/runs/ed7fa29/phase2-native-off-v3/summary.json) and the [four affected profile suites](src/runs/ed7fa29/phase2-native-profile-v1/summary.json). The exact generation-exhaustion counter is tested; the store's exhausted-slot branch is reviewed rather than forced through trillions of reuse cycles. Transient RX retries and both cancellation orders are covered. HTTP remains one-shot until phase 3 adds backlog and completion/work/DB lifetime pins.
+Production state model passed [all 20 release tests](src/runs/ed7fa29/phase2-native-off-v3/summary.json) and the [four affected profile suites](src/runs/ed7fa29/phase2-native-profile-v1/summary.json). The exact generation-exhaustion counter is tested; the store's exhausted-slot branch is reviewed rather than forced through trillions of reuse cycles. Transient RX retries and both cancellation orders are covered.
 
 Gate: state/lifetime contracts pass independently. Do not activate persistent RX in the HTTP server until bounded input and request gating are complete.
 
@@ -146,13 +146,17 @@ Likely files: `src/server/server.cpp`, `src/server/net/*`, session driving in `s
 - [x] Add saturation tests for full work lists, exhausted leases, TX-busy input, parser fragments, long valid header sequences, partial sends and repeated pause/resume.
 - [x] Add HTTP tests for write-then-read pipelines, duplicate-readiness events, auth/body rejection, half-close with several valid requests, incomplete final requests and stop during a pending commit/send.
 - [x] Keep control/stop processing possible at capacity. Verify no dropped bytes, duplicate writes, response reordering, unbounded growth, retry spinning or premature record reuse.
-- [ ] Make the production cutover directly after its gate passes. Remove the old exclusive-I/O completion path and obsolete APIs; keep historical controls in Git and probes rather than a permanent runtime compatibility switch.
-- [ ] Run the first matched short 350k HTTP control/candidate pair before changing layouts. Fix the numeric wait settings, drain/pool budgets and write cap; retain the accepted pipeline executable as the next layout control.
+- [x] Make the production cutover directly after its gate passes. Remove the old exclusive-I/O completion path and obsolete APIs; keep historical controls in Git and probes rather than a permanent runtime compatibility switch.
+- [x] Run the first matched short 350k HTTP control/candidate pair before changing layouts. Fix the numeric wait settings, drain/pool budgets and write cap; retain the accepted pipeline executable as the next layout control.
 - [ ] Before phase 4, isolate the higher tails: hold p99 rose from 18.53 to 74.62 ms in the first 350k pair. Keep the pipeline, workload and numeric wait settings fixed while locating the stalls; do not hide the regression behind layout changes.
 
 Checks: [21 release tests](src/runs/ed7fa29/phase3-regressions-off/summary.json), [five profile suites](src/runs/ed7fa29/phase3-profile/summary.json) and [five ASan/UBSan suites](src/runs/ed7fa29/phase3-sanitized/summary.json) passed. Regression cases cover SEND/data/EOF in one collected prefix, positive terminal RX rearming and TX/stop with all RX leases held. The [updated retry probe](src/runs/ed7fa29/phase3-probes-sanitized-v2/summary.json) also passed with sanitizers.
 
-The [first 350k pair](src/runs/ed7fa29/phase3-http-comparison/summary.json) passed with zero errors: CPU 20.63 to 19.39 us/request (-6.0%, kernel -7.0%), hold p99 18.53 to 74.62 ms, peak RAM +72.73 MiB. No memory-limit events or OOM; both servers exited cleanly. Accepting this tradeoff remains open, so phase 4 stays deferred.
+The [first 350k pair](src/runs/ed7fa29/phase3-http-comparison/summary.json) passed with zero errors: CPU 20.63 to 19.39 us/request (-6.0%, kernel -7.0%), hold p99 18.53 to 74.62 ms, peak RAM +72.73 MiB. No memory-limit events or OOM; both servers exited cleanly. The later release pair below did not reproduce the higher tails.
+
+Tail follow-up: CQ-service timestamps now survive the RX backlog, and retries run after application buffer returns. The new retry regression fails before the fix; [five profile](src/runs/25b8f18/tail-service-hooks-retry-fix/summary.json) and [five off suites](src/runs/25b8f18/tail-service-hooks-retry-fix-off/summary.json) pass afterward. The [350k diagnostic](src/runs/25b8f18/pipeline-retry-tail-diagnostic-350000/summary.json) has hold p99 18.66 ms and zero errors, but no ENOBUFS. Its worst client window overlaps a 55.77-ms commit; the original tail regression remains unattributed.
+
+The [fresh release pair](src/runs/25b8f18/pipeline-tail-release-comparison/summary.json) verifies the functional pipeline at 350k: CPU 20.06 to 19.72 us/request (-1.7%), hold p99 17.61 to 17.57 ms, peak RAM -35.31 MiB, zero errors. The original tail spike did not recur; its attribution gate remains open. No layout or wait-policy tuning was added.
 
 Gate: native, HTTP ordering and exhaustion tests pass and the first HTTP comparison justifies continuing. Do not use a later layout change to conceal a pipeline regression. Parser/application/storage changes outside transport-driving requirements are separate work. If a memory or fairness fix requires new API behavior, stop and revise the plan.
 
@@ -162,9 +166,9 @@ Likely files: `src/server/net/connections.*`, connection storage and the focused
 
 - [ ] Record release-mode sizes, offsets and allocations for hot records, operation tags, backlog metadata, Exchanges and work items. Report open/active/pooled counts separately.
 - [ ] Start from compact AoS hot records and the existing cold Exchange boundary. Compare stable, lazily allocated slot blocks with per-connection allocation before adding AoSoA.
-- [ ] Compare a small AoSoA block only where access traces justify grouping fields. Keep handles valid through growth and reclaim no slot before its lifetime gate.
-- [ ] Consider SoA for actual bulk scans; do not replace event-driven indexed access with full-registry scans to make vectorization possible.
-- [ ] Keep wait policy, drain budgets, pool size and request ordering fixed across each layout comparison. Measure cache behavior where counters are available, plus CPU, memory and tails.
+- [ ] Compare small AoSoA blocks for the deduplicated active set where traces show repeated access to the same RX/TX flags, states or buffer indices. Measure block occupancy, unused storage and handle-resolution cost; keep handles valid through growth and reclaim no slot before its lifetime gate.
+- [ ] Use SoA only for fields processed together in real bulk loops. Visit active connections rather than scanning the idle registry to manufacture a SIMD workload.
+- [ ] Measure locality gains independently of SIMD. Keep wait policy, drain budgets, pool size and request ordering fixed; compare cache behavior where counters are available, CPU/request, RAM and tails. Vectorization remains later work for a measured, regular bulk loop.
 - [ ] Retain a layout only with a measured benefit. Remove rejected layout code rather than accumulating template/runtime branches.
 - [ ] Confirm a promising layout against the accepted phase-3 pipeline with the same short HTTP workload and wait policy before tuning scheduling.
 
@@ -191,6 +195,7 @@ Gate: retain demonstrated gains without changing API behavior or the resource bu
 - [ ] Extend existing typed telemetry only where needed: work depth/age, dedup count, held RX bytes/leases, RX/TX/request phases, pause/cancel/rearm and write-batch size.
 - [ ] Put timing or bounded flight records in profile mode. Release/off must add no diagnostic clocks, formatting or logging; inspect the generated hot-path code after adding hooks.
 - [ ] Distinguish enqueue-to-service age from kernel completion-to-service age. The latter needs kernel event timing; an application timestamp alone cannot supply it.
+- [ ] Keep bounded checkpoint event capture useful throughout a run: the latest diagnostic dropped 891 slow-sync and 8579 WAL-advice events. Aggregated histograms and windows remain available.
 
 Use references for specific mechanisms, not as new runtime dependencies:
 
@@ -223,7 +228,7 @@ Historical full-profile reference: `d297ca9`, 128 CQEs / 8 ms, 4-ms receive prob
 - [x] Isolate the 128-socket wait regression ([data](src/runs/701bae9/multishot-128-analysis/summary.json)): a known-ready CQE waits 8.03 ms at target 128. CQ 32 cuts native stream wall time from 309 to 58 ms; extra buffers alone reach 152 ms
 - [x] Compare ready-first and wait-one at 16/128/512 sockets ([data](src/runs/701bae9/multishot-wait-policies/summary.json)). Ready-first improves streams; wait-one lowers pingpong p99 but costs more CPU at 128/512. Six suites passed, including queued SQEs, deferred work, cancellation and the 256-CQE bound
 - [x] Reject the primary-ready-only HTTP change after the [350k pair](src/runs/701bae9/ready-cq-http-comparison/summary.json): CPU 20.95 to 22.38 us/request, hold p99 18.11 to 58.87 ms. Both passed with zero errors; restore production and keep the native experiments
-- [ ] Approve the proposed transport pipeline above before implementation; keep parser/application/storage and complete each phase's gate before moving on
+- [x] Approve the proposed transport pipeline above before implementation; keep parser/application/storage and complete each phase's gate before moving on
 
 - [x] Capture the [five-minute profile](src/runs/d297ca9/baseline-full-profile-350000-5m-analysis/summary.json): 217,114 CPU samples, no lost records, 20.56 us/request and zero HTTP errors. Recover the saved data after the original decoder timeout
 - [x] Keep cap 32 after the 16/32-write comparison: 3.2% less CPU and 2.4% less kernel CPU in the short pair. The historical full-profile reference remains cap 16

@@ -1,0 +1,45 @@
+{
+  "measurement": {
+    "contracts": [
+      "operation_state_contract",
+      "io_lifetime_contract",
+      "transport_lifetimes",
+      "receive_backend_contract",
+      "pipeline_ownership_contract"
+    ],
+    "telemetry": "off",
+    "compiler_container": "td-operation-state",
+    "full_ctest": false
+  },
+  "schema_version": 1,
+  "anchor": "25b8f1883362eacc4a493c530886dac4a34138aa",
+  "label": "tail-service-hooks-retry-fix-off",
+  "kind": "probe",
+  "started_at": "2026-11-05T12:52:00.701185+00:00",
+  "status": "passed",
+  "finished_at": "2026-11-05T12:52:48.300081+00:00",
+  "exit_code": 0,
+  "error": null,
+  "secondary_errors": [],
+  "workload": {
+    "kind": "transport_contracts"
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "perf": "off",
+    "client_diagnostics": false
+  },
+  "provenance": {
+    "source": {
+      "base_commit": "25b8f1883362eacc4a493c530886dac4a34138aa",
+      "patch_sha256": "67cc662c104106bd8a8b44772ed9567a050a39d19e3edb335692e95fe44411dd",
+      "source_sha256": "9b3dc3a6677d69fed13bfc72a8af99b7222dded2752213ba1b36116ace53375d",
+      "patch": "source.patch"
+    },
+    "binary": {
+      "server": {
+        "sha256": "597f5c89ff57259c9e53bf308a22251b67012747ed1e193620267642cad2bd31"
+      }
+    }
+  }
+}

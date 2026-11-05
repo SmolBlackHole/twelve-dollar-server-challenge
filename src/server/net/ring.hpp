@@ -101,6 +101,7 @@ class Ring
 #if TDS_TELEMETRY_LEVEL == 2
         telemetry::RingCounters previous;
         telemetry::RingTimings interval;
+        std::array<std::uint64_t, ReceiveBuffers::count> receive_service_ns{};
 #endif
         unsigned previous_overflow = 0;
     } statistics;

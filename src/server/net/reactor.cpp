@@ -246,10 +246,6 @@ void Reactor::finish_ring()
     {
         advance_shutdown(owner);
     }
-    else
-    {
-        retry_receives(owner);
-    }
     ring_started_ = false;
     ++ring_index_;
 }
@@ -257,6 +253,14 @@ void Reactor::finish_ring()
 void Reactor::finish_turn()
 {
     assert(!ring_started_ && ring_index_ == rings_.size());
+    if (!stopping_)
+    {
+        // Collection hands off leases; consume their returned credits before waiting again
+        for (const auto &owner : rings_)
+        {
+            retry_receives(*owner);
+        }
+    }
     finish_wakeups();
     previous_count_ = turn_count_;
 }
@@ -630,7 +634,7 @@ void Reactor::complete_io(Connection &connection, Event event, int result, unsig
     }
     else
     {
-        IoTelemetry::receive_completed(connection, result);
+        IoTelemetry::receive_completed(connection, result, buffer);
     }
     if (event == Event::send)
     {

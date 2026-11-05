@@ -1892,50 +1892,94 @@ void multishot_natural_exhaustion()
     reactor.receive(connection);
     std::vector<ReceiveBufferLease> held;
     held.reserve(ReceiveBuffers::count);
+    // Isolate returned-buffer progress from the fallback's timed permission
+    connection.ring.next_receive_probe = deadline;
     bool exhausted = false;
     while (!exhausted)
     {
         peer.send_byte();
         await_completion(reactor, deadline);
         reactor.begin_turn();
-        drain_turn(reactor, [&](Completion &completion) {
-            if (completion.kind == CompletionKind::received && completion.result > 0)
+        for (auto records = reactor.collect(); !records.empty(); records = reactor.collect())
+        {
+            for (auto &completion : records)
             {
-                require(completion.result == 1 && completion.buffer.bytes().front() == 'x' &&
-                            (completion.flags & IORING_CQE_F_MORE),
-                        "exhaustion lost multishot data or MORE");
-                held.push_back(std::move(completion.buffer));
+                if (completion.kind == CompletionKind::received && completion.result > 0)
+                {
+                    require(completion.result == 1 && completion.buffer.bytes().front() == 'x' &&
+                                (completion.flags & IORING_CQE_F_MORE),
+                            "exhaustion lost multishot data or MORE");
+                    held.push_back(std::move(completion.buffer));
+                }
+                if (completion.operation.event() == Event::receive && completion.result == -ENOBUFS)
+                {
+                    require(!(completion.flags & IORING_CQE_F_MORE) && !connection.rx.active() &&
+                                !connection.rx.cancelling() && !connection.rx.cancel_requested(),
+                            "natural ENOBUFS invented an outstanding original or cancellation");
+                    exhausted = true;
+                }
+                completion.reset();
             }
-            if (completion.operation.event() == Event::receive && completion.result == -ENOBUFS)
-            {
-                require(!(completion.flags & IORING_CQE_F_MORE) && !connection.rx.active() &&
-                            !connection.rx.cancelling() && !connection.rx.cancel_requested(),
-                        "natural ENOBUFS invented an outstanding original or cancellation");
-                exhausted = true;
-            }
-        });
+        }
+        reactor.finish_turn();
     }
     require(held.size() == ReceiveBuffers::count,
             "multishot exhausted before every provided buffer was retained");
+    auto &owner = connection.ring;
     reactor.send(connection, message);
     bool sent = false;
+    unsigned quiet_pending = 0;
     while (!sent)
     {
         await_completion(reactor, deadline);
         reactor.begin_turn();
-        drain_turn(reactor, [&](const Completion &completion) {
-            require(completion.kind != CompletionKind::received,
-                    "TX at RX exhaustion invented input without a provided buffer");
-            if (completion.kind == CompletionKind::sent)
+        for (auto records = reactor.collect(); !records.empty(); records = reactor.collect())
+        {
+            for (auto &completion : records)
             {
-                require(!sent && completion.connection == &connection && completion.result == 1,
-                        "TX needed an RX lease or completed its byte count incorrectly");
-                sent = true;
+                require(completion.kind != CompletionKind::received,
+                        "TX at RX exhaustion invented input without a provided buffer");
+                if (completion.kind == CompletionKind::sent)
+                {
+                    require(!sent && completion.connection == &connection && completion.result == 1,
+                            "TX needed an RX lease or completed its byte count incorrectly");
+                    sent = true;
+                }
+                completion.reset();
             }
-        });
+        }
+        if (sent)
+        {
+            require(connection.receive_deferred && !connection.rx.busy() &&
+                        owner.staged_count == 0 && owner.ready.empty() &&
+                        io_uring_sq_ready(&owner.queue) == 0 &&
+                        io_uring_cq_ready(&owner.queue) == 0,
+                    "returned-credit fixture retained another source of runnable work");
+            quiet_pending = owner.pending;
+            // Application consumption returns this credit after collection's retry pass
+            held.back().release();
+        }
+        reactor.finish_turn();
     }
     require(peer.drain_bytes('y') == payload.size() && held.size() == ReceiveBuffers::count,
             "TX at RX exhaustion lost bytes or released held input");
+    reactor.begin_turn();
+    require(connection.rx.active() && !connection.receive_deferred &&
+                owner.pending == quiet_pending + 1,
+            "wait slept before preparing RX from a credit returned after collection");
+    unsigned resumed = 0;
+    drain_turn(reactor, [&](Completion &completion) {
+        if (completion.kind == CompletionKind::received)
+        {
+            require(completion.connection == &connection && completion.result == 1 &&
+                        (completion.flags & IORING_CQE_F_MORE) &&
+                        completion.buffer.bytes().front() == 'x',
+                    "returned-credit retry lost the already readable byte");
+            completion.buffer.release();
+            ++resumed;
+        }
+    });
+    require(resumed == 1, "returned-credit retry did not service input before collecting again");
     reactor.request_stop();
     while (reactor.pending_count())
     {
@@ -2339,19 +2383,42 @@ void telemetry_hook_contracts()
 #if TDS_TELEMETRY_LEVEL < 2
         // Basic and off scopes must not inspect even an absent Exchange
         const auto inactive_handler = collector.handler(connection);
+        collector.receive(connection, ReceiveBufferLease{}).attach(connection);
         collector.send_prepared(connection);
         collector.send_completed(Completion{});
 #endif
-        const auto received = collector.receive();
+        ReceiveBufferLease selected(owner.receive_buffers.get(), 0, 1);
+        IoTelemetry::receive_completed(connection, 1, selected);
 #if TDS_TELEMETRY_LEVEL == 2
-        const auto before_allocation = tds::timing::now_ns();
+        const auto receive_ns = owner.statistics.receive_service_ns[selected.id()];
+        const auto before_retention = tds::timing::now_ns();
+        require(receive_ns > 0 && receive_ns <= before_retention,
+                "receive service time was not sampled before buffer retention");
 #endif
+        owner.backlog.push(connection.input, std::move(selected));
+        ReceiveBufferLease following(owner.receive_buffers.get(), 1, 1);
+        IoTelemetry::receive_completed(connection, 1, following);
+#if TDS_TELEMETRY_LEVEL == 2
+        const auto following_ns = owner.statistics.receive_service_ns[following.id()];
+        require(owner.statistics.receive_service_ns[0] == receive_ns &&
+                    following_ns >= before_retention,
+                "a later receive changed an earlier held buffer's service time");
+#endif
+        owner.backlog.push(connection.input, std::move(following));
+        auto buffered = owner.backlog.pop(connection.input);
+        auto next_buffered = owner.backlog.pop(connection.input);
+        const auto received = collector.receive(connection, buffered);
+        const auto next_received = collector.receive(connection, next_buffered);
         connection.exchange = owner.acquire_exchange();
+        next_received.attach(connection);
+#if TDS_TELEMETRY_LEVEL == 2
+        require(connection.exchange->receive_serviced_ns == following_ns,
+                "backlog consumption lost the later buffer's exact service time");
+#endif
         received.attach(connection);
 #if TDS_TELEMETRY_LEVEL == 2
-        const auto receive_ns = connection.exchange->receive_serviced_ns;
-        require(receive_ns > 0 && receive_ns <= before_allocation,
-                "receive service time moved after exchange allocation");
+        require(connection.exchange->receive_serviced_ns == receive_ns,
+                "backlog consumption replaced the original buffer's service time");
 #endif
         const auto accept = [&](tds::AcceptedHead head) {
             auto &session = connection.exchange->session;
@@ -2399,7 +2466,7 @@ void telemetry_hook_contracts()
         owner.recycle_exchange(std::move(pooled));
         Completion completion;
         IoTelemetry::receive_prepared(connection);
-        IoTelemetry::receive_completed(connection, -ENOBUFS);
+        IoTelemetry::receive_completed(connection, -ENOBUFS, ReceiveBufferLease{});
         IoTelemetry::receive_deferred(connection);
 #if TDS_TELEMETRY_LEVEL == 2
         const auto first_enobufs = connection.receive_enobufs_since_ns;
@@ -2407,7 +2474,7 @@ void telemetry_hook_contracts()
         require(first_enobufs > 0 && connection.receive_enobufs_since_ns == first_enobufs,
                 "repeated deferral replaced the first ENOBUFS time");
 #endif
-        IoTelemetry::receive_completed(connection, 1);
+        IoTelemetry::receive_completed(connection, 1, buffered);
 #if TDS_TELEMETRY_LEVEL == 2
         require(connection.receive_enobufs_since_ns == 0 &&
                     owner.statistics.interval.enobufs_to_successful_receive_service_ns.count() == 1,
@@ -2452,7 +2519,7 @@ void telemetry_hook_contracts()
                     window.timings.write_batch_wall_ns.count() == 1,
                 "profile scope classification, completion or unwind accounting changed");
         require(ring.counters.cqes == 3 && ring.counters.receive_submissions == 1 &&
-                    ring.counters.receive_completions == 2 && ring.counters.receive_enobufs == 1 &&
+                    ring.counters.receive_completions == 4 && ring.counters.receive_enobufs == 1 &&
                     ring.counters.cq_overflow_counter_delta == 3 &&
                     ring.counters.empty_cq_samples == 1 &&
                     ring.timings.cq_ready_before_drain.count() == 1 &&
@@ -2523,7 +2590,7 @@ void telemetry_hook_contracts()
             "transport artifact lost its ring snapshot");
     auto *ring = yyjson_arr_get(rings, 0);
     require(number(ring, "cqes") == 5 && number(ring, "receive_submissions") == 1 &&
-                number(ring, "receive_completions") == 2 && number(ring, "receive_enobufs") == 1 &&
+                number(ring, "receive_completions") == 4 && number(ring, "receive_enobufs") == 1 &&
                 number(ring, "cq_overflow_counter_delta") == 3 &&
                 number(ring, "exchange_allocations") == 2 &&
                 number(ring, "exchange_pool_hits") == 1 && number(ring, "pooled_exchanges") == 1 &&

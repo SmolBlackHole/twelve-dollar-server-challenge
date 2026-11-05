@@ -105,7 +105,9 @@ IoTelemetry::WriteBatch::~WriteBatch()
     owner_.interval_.write_batch_wall_ns.record(timing::now_ns() - started_ns_);
 }
 
-IoTelemetry::Receive::Receive() noexcept : serviced_ns_(timing::now_ns())
+IoTelemetry::Receive::Receive(const net::Connection &connection,
+                              const net::ReceiveBufferLease &buffer) noexcept
+    : serviced_ns_(connection.ring.statistics.receive_service_ns[buffer.id()])
 {
 }
 
@@ -168,7 +170,8 @@ void IoTelemetry::receive_prepared(net::Connection &connection) noexcept
     ++connection.ring.statistics.totals.receive_submissions;
 }
 
-void IoTelemetry::receive_completed(net::Connection &connection, int result) noexcept
+void IoTelemetry::receive_completed(net::Connection &connection, int result,
+                                    [[maybe_unused]] const net::ReceiveBufferLease &buffer) noexcept
 {
     auto &sample = connection.ring.statistics;
     ++sample.totals.receive_completions;
@@ -177,12 +180,18 @@ void IoTelemetry::receive_completed(net::Connection &connection, int result) noe
         ++sample.totals.receive_enobufs;
     }
 #if TDS_TELEMETRY_LEVEL == 2
-    else if (result > 0 && connection.receive_enobufs_since_ns)
+    else if (result > 0 && buffer)
     {
-        // Deferral includes retry I/O and CQ service, not socket arrival age
-        sample.interval.enobufs_to_successful_receive_service_ns.record(
-            timing::now_ns() - connection.receive_enobufs_since_ns);
-        connection.receive_enobufs_since_ns = 0;
+        const auto serviced_ns = timing::now_ns();
+        // The lease keeps its buffer ID exclusive while CQ records and backlog hold it
+        sample.receive_service_ns[buffer.id()] = serviced_ns;
+        if (connection.receive_enobufs_since_ns)
+        {
+            // Deferral includes retry I/O and CQ service, not socket arrival age
+            sample.interval.enobufs_to_successful_receive_service_ns.record(
+                serviced_ns - connection.receive_enobufs_since_ns);
+            connection.receive_enobufs_since_ns = 0;
+        }
     }
 #endif
 }

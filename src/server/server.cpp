@@ -416,7 +416,7 @@ class Server::State
         }
         auto lease = connection.ring.backlog.pop(connection.input);
         ++connection.ring.rx_slices;
-        const auto received = telemetry.receive();
+        const auto received = telemetry.receive(connection, lease);
         received.attach(connection);
         const auto input = lease.bytes();
         session.append({input.data(), input.size()});

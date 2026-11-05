@@ -1,0 +1,80 @@
+{
+  "measurement": {
+    "variants": [
+      {
+        "run": "pipeline-tail-release-control-350000",
+        "status": "passed",
+        "requests": 3627602,
+        "cpu_us_per_request": 20.06126967622137,
+        "user_us_per_request": 5.410701890670476,
+        "kernel_us_per_request": 14.650567785550896,
+        "hold": {
+          "count": 2222941,
+          "avg": 4.49368580281,
+          "p95": 10.841008,
+          "p99": 17.6127348,
+          "max": 33.266003
+        },
+        "peak_mib": 1834.26171875,
+        "errors": 0.0,
+        "generator_sha256": "f2634e9500b5017ee4c3ca77329ea8a98c54544b92e972ba9ba637fba69a4a1e",
+        "server_sha256": "5c6c8150ce9e38c9c57d7aff4071d6e0fa0a02ea3a86255e2d63277849db828b"
+      },
+      {
+        "run": "pipeline-tail-release-candidate-350000",
+        "status": "passed",
+        "requests": 3628332,
+        "cpu_us_per_request": 19.72057683806223,
+        "user_us_per_request": 5.450491851352082,
+        "kernel_us_per_request": 14.270085262318883,
+        "hold": {
+          "count": 2223984,
+          "avg": 4.55420543202,
+          "p95": 10.65589995,
+          "p99": 17.57230837,
+          "max": 32.235602
+        },
+        "peak_mib": 1798.94921875,
+        "errors": 0.0,
+        "generator_sha256": "f2634e9500b5017ee4c3ca77329ea8a98c54544b92e972ba9ba637fba69a4a1e",
+        "server_sha256": "597f5c89ff57259c9e53bf308a22251b67012747ed1e193620267642cad2bd31"
+      }
+    ],
+    "delta": {
+      "cpu_percent": -1.6982615938958556,
+      "kernel_cpu_percent": -2.597049676172025,
+      "hold_p99_percent": -0.22952954472464926,
+      "peak_mib": -35.3125
+    },
+    "decision": "functional pipeline verified; original tail event remains unattributed",
+    "limitations": [
+      "one fresh A/B pair",
+      "local WSL 6.18.54.1, not target Linux 6.8"
+    ]
+  },
+  "schema_version": 1,
+  "anchor": "25b8f1883362eacc4a493c530886dac4a34138aa",
+  "label": "pipeline-tail-release-comparison",
+  "kind": "comparison",
+  "started_at": "2026-11-05T13:07:16.460336+00:00",
+  "status": "passed",
+  "finished_at": "2026-11-05T13:07:16.462465+00:00",
+  "exit_code": 0,
+  "error": null,
+  "secondary_errors": [],
+  "workload": {
+    "vus": 350000,
+    "ramp": "30s",
+    "hold": "60s",
+    "seed": 20261104
+  },
+  "instruments": {
+    "server_telemetry": "off",
+    "client_diagnostics": false,
+    "perf": "off"
+  },
+  "provenance": {
+    "source": null,
+    "binary": null
+  }
+}
